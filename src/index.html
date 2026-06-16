@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<meta name="description"
+		content="Remove steganography from media files. Strip metadata, clear LSBs, blur, and sanitize images directly in your browser." />
+	<title>Media Steganography Remover</title>
+</head>
+
+<body>
+	<div class="app">
+		<header class="header">
+			<h1 class="header__title">Media Steganography Remover</h1>
+			<p class="header__subtitle">Remove hidden data from media files locally in your browser.</p>
+		</header>
+
+		<main class="main">
+			<section class="drop-zone" id="drop-zone">
+				<input type="file" id="file-input" class="drop-zone__input" accept="image/*,video/*" multiple
+					aria-label="Upload media files" />
+				<div class="drop-zone__content">
+					<p class="drop-zone__icon" aria-hidden="true">&#128462;</p>
+					<p class="drop-zone__text">Drop media files here or click to browse</p>
+					<p class="drop-zone__hint">PNG, JPEG, WebP, BMP, GIF, MP4, WebM, MOV, AVI</p>
+				</div>
+			</section>
+
+			<section class="file-list" id="file-list-section" hidden>
+				<h2 class="section-title">Files <span class="file-list__count" id="file-count">0</span></h2>
+				<ul class="file-list__items" id="file-list"></ul>
+			</section>
+
+			<section class="options" id="options-section">
+				<h2 class="section-title">Processing Options</h2>
+
+				<div class="options__grid">
+					<label class="option option--info">
+						<input type="checkbox" id="strip-metadata" checked disabled />
+						<span class="option__label">Strip metadata <span class="option__tag">images &amp;
+								videos</span></span>
+						<span class="option__hint">Always on. Removes image metadata and re-encodes video streams to
+							strip container-level hidden data.</span>
+					</label>
+
+					<label class="option">
+						<input type="checkbox" id="clear-lsb" />
+						<span class="option__label">Clear LSBs <span class="option__tag">images only</span></span>
+						<span class="option__hint">Zeros the lowest bit of every RGB value. Invisible to the eye, but
+							removes 1 bit of color precision per channel.</span>
+					</label>
+
+					<label class="option">
+						<input type="checkbox" id="randomize-lsb" />
+						<span class="option__label">Randomize LSBs <span class="option__tag">images only</span></span>
+						<span class="option__hint">Replaces the lowest bit of every RGB value with random noise. The
+							image looks unchanged.</span>
+					</label>
+
+					<label class="option">
+						<input type="checkbox" id="apply-blur" />
+						<span class="option__label">Apply blur <span class="option__tag">images only</span></span>
+						<span class="option__hint">A light box blur that wipes high-frequency steganographic patterns.
+							Slightly softens the image.</span>
+					</label>
+
+					<label class="option">
+						<input type="checkbox" id="jpeg-recompress" />
+						<span class="option__label">JPEG re-compress <span class="option__tag">images only</span></span>
+						<span class="option__hint">Forces JPEG output at the selected quality. Very destructive to
+							hidden data, but lossy; lower quality = smaller files and stronger sanitization.</span>
+					</label>
+				</div>
+
+				<div class="options__controls">
+					<div class="control">
+						<label for="blur-radius" class="control__label">Blur radius</label>
+						<input type="range" id="blur-radius" min="0.5" max="3" step="0.5" value="1" />
+						<output class="control__value" id="blur-radius-value">1px</output>
+					</div>
+
+					<div class="control">
+						<label for="jpeg-quality" class="control__label">JPEG quality</label>
+						<input type="range" id="jpeg-quality" min="1" max="100" step="1" value="85" />
+						<output class="control__value" id="jpeg-quality-value">85%</output>
+					</div>
+
+				</div>
+
+				<div class="options__group" id="output-formats-group" hidden>
+					<h3 class="options__group-title">Output formats</h3>
+					<p class="control__value" id="output-format-note">Each input type can have its own output format.
+					</p>
+					<div class="options__controls" id="output-format-rows"></div>
+				</div>
+
+				<div class="options__group">
+					<h3 class="options__group-title">File naming</h3>
+
+					<fieldset class="mode-group" id="filename-mode-group">
+						<legend class="visually-hidden">Filename mode</legend>
+						<label class="mode-option">
+							<input type="radio" name="filename-mode" value="suffix" checked />
+							<span>Suffix</span>
+						</label>
+						<label class="mode-option">
+							<input type="radio" name="filename-mode" value="prefix" />
+							<span>Prefix</span>
+						</label>
+						<label class="mode-option">
+							<input type="radio" name="filename-mode" value="hash" />
+							<span>Hash</span>
+						</label>
+					</fieldset>
+
+					<div class="mode-panel" id="suffix-panel">
+						<div class="control">
+							<label for="output-suffix" class="control__label">Suffix</label>
+							<input type="text" id="output-suffix" value="-clean" maxlength="50" />
+							<span class="control__value">Example: photo.png → photo-clean.png</span>
+						</div>
+					</div>
+
+					<div class="mode-panel" id="prefix-panel" hidden>
+						<div class="control-row">
+							<div class="control">
+								<label for="output-prefix" class="control__label">Prefix</label>
+								<input type="text" id="output-prefix" value="file" maxlength="50" />
+							</div>
+							<div class="control">
+								<label for="prefix-start-index" class="control__label">Start index</label>
+								<input type="number" id="prefix-start-index" value="0" min="0" step="1" />
+							</div>
+						</div>
+						<span class="control__value">Example: file.png, file1.png, file2.png…</span>
+					</div>
+
+					<div class="mode-panel" id="hash-panel" hidden>
+						<fieldset class="mode-group">
+							<legend class="visually-hidden">Hash length</legend>
+							<label class="mode-option">
+								<input type="radio" name="hash-length" value="16" />
+								<span>16 chars</span>
+							</label>
+							<label class="mode-option">
+								<input type="radio" name="hash-length" value="32" checked />
+								<span>32 chars</span>
+							</label>
+							<label class="mode-option">
+								<input type="radio" name="hash-length" value="full" />
+								<span>Full</span>
+							</label>
+						</fieldset>
+						<span class="control__value">Filename is the SHA-256 of the output bytes.</span>
+					</div>
+				</div>
+			</section>
+
+			<div class="actions">
+				<button type="button" id="process-all" class="button button--primary" disabled>Process All</button>
+				<button type="button" id="download-all" class="button" disabled>Download All (ZIP)</button>
+				<button type="button" id="clear-all" class="button button--danger">Clear All</button>
+			</div>
+
+			<section class="progress" id="progress-section" hidden>
+				<div class="progress__bar" id="progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0"
+					aria-valuemax="100">
+					<div class="progress__fill" id="progress-fill"></div>
+				</div>
+				<p class="progress__text" id="progress-text">Ready</p>
+			</section>
+
+			<section class="results" id="results-section" hidden>
+				<h2 class="section-title">Results</h2>
+				<ul class="results__items" id="results-list"></ul>
+			</section>
+		</main>
+
+		<footer class="footer">
+			<p>All processing happens locally in your browser. No files are uploaded.</p>
+		</footer>
+	</div>
+
+	<script type="module" src="./index.ts"></script>
+</body>
+
+</html>

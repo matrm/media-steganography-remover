@@ -1,0 +1,26 @@
+{
+  "name": "media-steganography-remover",
+  "private": true,
+  "version": "1.0.0",
+  "description": "A single-file web page that removes steganography from media files.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "npm run build && vite preview"
+  },
+  "author": "matrm <matrm@gmx.com>",
+  "license": "MIT",
+  "devDependencies": {
+    "@ffmpeg/core": "^0.12.10",
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@types/jszip": "^3.4.1",
+    "@types/node": "^25.9.3",
+    "jszip": "^3.10.1",
+    "omggif": "^1.0.10",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vite-plugin-singlefile": "^2.3.3",
+    "vite-plugin-static-copy": "^4.1.1"
+  }
+}
