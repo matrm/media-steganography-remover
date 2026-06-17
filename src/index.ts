@@ -69,6 +69,7 @@ const SUPPORTED_VIDEO_TYPES = new Set([
 
 const GIF_MIME = 'image/gif';
 const VIDEO_MIME = 'video/mp4';
+const COLLAPSE_THRESHOLD = 10;
 
 // ---------------------------------------------------------------------------
 // DOM refs
@@ -112,6 +113,8 @@ const resultsList = document.getElementById('results-list') as HTMLElement;
 
 let queuedFiles: QueuedFile[] = [];
 let processedFiles: ProcessedFile[] = [];
+let fileListExpanded = false;
+let resultsExpanded = false;
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -964,7 +967,13 @@ function updateFileList(): void {
 	fileCount.textContent = String(queuedFiles.length);
 	fileListSection.hidden = queuedFiles.length === 0;
 
-	for (const queued of queuedFiles) {
+	const oldToggle = fileListSection.querySelector('.file-list__toggle');
+	if (oldToggle) oldToggle.remove();
+
+	const shouldCollapse = queuedFiles.length > COLLAPSE_THRESHOLD && !fileListExpanded;
+	const displayFiles = shouldCollapse ? queuedFiles.slice(0, COLLAPSE_THRESHOLD) : queuedFiles;
+
+	for (const queued of displayFiles) {
 		const li = document.createElement('li');
 		li.className = 'file-item';
 
@@ -1006,6 +1015,20 @@ function updateFileList(): void {
 		fileList.append(li);
 	}
 
+	if (queuedFiles.length > COLLAPSE_THRESHOLD) {
+		const toggle = document.createElement('button');
+		toggle.className = 'file-list__toggle';
+		toggle.type = 'button';
+		toggle.textContent = fileListExpanded
+			? 'Show less'
+			: `Show all ${queuedFiles.length} files (${queuedFiles.length - COLLAPSE_THRESHOLD} more)`;
+		toggle.addEventListener('click', () => {
+			fileListExpanded = !fileListExpanded;
+			updateFileList();
+		});
+		fileListSection.append(toggle);
+	}
+
 	processAllBtn.disabled = queuedFiles.length === 0;
 	updateOutputFormatRows();
 }
@@ -1027,6 +1050,7 @@ function addFilesToQueue(files: FileList | null): void {
 			objectUrl: URL.createObjectURL(file),
 		});
 	}
+	fileListExpanded = false;
 	updateFileList();
 }
 
@@ -1034,7 +1058,15 @@ function updateResults(): void {
 	resultsList.innerHTML = '';
 	resultsSection.hidden = processedFiles.length === 0;
 
-	for (const result of processedFiles) {
+	const oldToggle = resultsSection.querySelector('.results__toggle');
+	if (oldToggle) oldToggle.remove();
+
+	const displayResults =
+		processedFiles.length > COLLAPSE_THRESHOLD && !resultsExpanded
+			? processedFiles.slice(0, COLLAPSE_THRESHOLD)
+			: processedFiles;
+
+	for (const result of displayResults) {
 		const li = document.createElement('li');
 		li.className = 'result-item';
 
@@ -1110,6 +1142,20 @@ function updateResults(): void {
 		resultsList.append(li);
 	}
 
+	if (processedFiles.length > COLLAPSE_THRESHOLD) {
+		const toggle = document.createElement('button');
+		toggle.className = 'results__toggle';
+		toggle.type = 'button';
+		toggle.textContent = resultsExpanded
+			? 'Show less'
+			: `Show all ${processedFiles.length} results (${processedFiles.length - COLLAPSE_THRESHOLD} more)`;
+		toggle.addEventListener('click', () => {
+			resultsExpanded = !resultsExpanded;
+			updateResults();
+		});
+		resultsSection.append(toggle);
+	}
+
 	downloadAllBtn.disabled = processedFiles.some((r) => r.success) === false;
 }
 
@@ -1139,6 +1185,7 @@ async function processAllFiles(): Promise<void> {
 
 	processAllBtn.disabled = true;
 	processedFiles = [];
+	resultsExpanded = false;
 	updateResults();
 
 	const options = getProcessingOptions();
@@ -1185,6 +1232,8 @@ function clearAll(): void {
 	}
 	queuedFiles = [];
 	processedFiles = [];
+	fileListExpanded = false;
+	resultsExpanded = false;
 	updateFileList();
 	updateResults();
 	progressSection.hidden = true;
