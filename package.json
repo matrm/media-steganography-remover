@@ -14,7 +14,6 @@
   "devDependencies": {
     "@ffmpeg/core": "^0.12.10",
     "@ffmpeg/ffmpeg": "^0.12.15",
-    "@types/jszip": "^3.4.1",
     "@types/node": "^25.9.3",
     "jszip": "^3.10.1",
     "omggif": "^1.0.10",
