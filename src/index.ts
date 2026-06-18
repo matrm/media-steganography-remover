@@ -69,7 +69,9 @@ const SUPPORTED_VIDEO_TYPES = new Set([
 
 const GIF_MIME = 'image/gif';
 const VIDEO_MIME = 'video/mp4';
-const COLLAPSE_THRESHOLD = 10;
+const GRID_COLUMNS = 4;
+const PAGE_ROWS = 4;
+const PAGE_SIZE = GRID_COLUMNS * PAGE_ROWS;
 
 // ---------------------------------------------------------------------------
 // DOM refs
@@ -113,8 +115,8 @@ const resultsList = document.getElementById('results-list') as HTMLElement;
 
 let queuedFiles: QueuedFile[] = [];
 let processedFiles: ProcessedFile[] = [];
-let fileListExpanded = false;
-let resultsExpanded = false;
+let fileListPage = 0;
+let resultsPage = 0;
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -857,6 +859,45 @@ async function processSingleFile(
 // UI helpers
 // ---------------------------------------------------------------------------
 
+function buildPagination(
+	container: HTMLElement,
+	currentPage: number,
+	totalPages: number,
+	onPageChange: (page: number) => void
+): void {
+	if (totalPages <= 1) return;
+
+	const row = document.createElement('div');
+	row.className = 'pagination';
+
+	const makeBtn = (label: string, disabled: boolean, onClick: () => void) => {
+		const btn = document.createElement('button');
+		btn.className = 'pagination__btn';
+		btn.type = 'button';
+		btn.textContent = label;
+		btn.disabled = disabled;
+		btn.addEventListener('click', onClick);
+		return btn;
+	};
+
+	row.append(
+		makeBtn('First', currentPage === 0, () => onPageChange(0)),
+		makeBtn('Prev', currentPage === 0, () => onPageChange(currentPage - 1))
+	);
+
+	const indicator = document.createElement('span');
+	indicator.className = 'pagination__indicator';
+	indicator.textContent = `Page ${currentPage + 1} of ${totalPages}`;
+	row.append(indicator);
+
+	row.append(
+		makeBtn('Next', currentPage >= totalPages - 1, () => onPageChange(currentPage + 1)),
+		makeBtn('Last', currentPage >= totalPages - 1, () => onPageChange(totalPages - 1))
+	);
+
+	container.append(row);
+}
+
 function getSelectedRadioValue(group: HTMLElement): string {
 	const radio = group.querySelector('input[type="radio"]:checked') as HTMLInputElement | null;
 	return radio?.value ?? '';
@@ -967,11 +1008,13 @@ function updateFileList(): void {
 	fileCount.textContent = String(queuedFiles.length);
 	fileListSection.hidden = queuedFiles.length === 0;
 
-	const oldToggle = fileListSection.querySelector('.file-list__toggle');
-	if (oldToggle) oldToggle.remove();
+	const oldPagination = fileListSection.querySelector('.pagination');
+	if (oldPagination) oldPagination.remove();
 
-	const shouldCollapse = queuedFiles.length > COLLAPSE_THRESHOLD && !fileListExpanded;
-	const displayFiles = shouldCollapse ? queuedFiles.slice(0, COLLAPSE_THRESHOLD) : queuedFiles;
+	const totalPages = Math.max(1, Math.ceil(queuedFiles.length / PAGE_SIZE));
+	fileListPage = Math.min(fileListPage, totalPages - 1);
+	const startIndex = fileListPage * PAGE_SIZE;
+	const displayFiles = queuedFiles.slice(startIndex, startIndex + PAGE_SIZE);
 
 	for (const queued of displayFiles) {
 		const li = document.createElement('li');
@@ -1011,23 +1054,14 @@ function updateFileList(): void {
 		remove.textContent = '×';
 		remove.addEventListener('click', () => removeFileFromQueue(queued.id));
 
-		li.append(thumb, info, remove);
+		li.append(remove, thumb, info);
 		fileList.append(li);
 	}
 
-	if (queuedFiles.length > COLLAPSE_THRESHOLD) {
-		const toggle = document.createElement('button');
-		toggle.className = 'file-list__toggle';
-		toggle.type = 'button';
-		toggle.textContent = fileListExpanded
-			? 'Show less'
-			: `Show all ${queuedFiles.length} files (${queuedFiles.length - COLLAPSE_THRESHOLD} more)`;
-		toggle.addEventListener('click', () => {
-			fileListExpanded = !fileListExpanded;
-			updateFileList();
-		});
-		fileListSection.append(toggle);
-	}
+	buildPagination(fileListSection, fileListPage, totalPages, (page) => {
+		fileListPage = page;
+		updateFileList();
+	});
 
 	processAllBtn.disabled = queuedFiles.length === 0;
 	updateOutputFormatRows();
@@ -1050,7 +1084,6 @@ function addFilesToQueue(files: FileList | null): void {
 			objectUrl: URL.createObjectURL(file),
 		});
 	}
-	fileListExpanded = false;
 	updateFileList();
 }
 
@@ -1058,13 +1091,13 @@ function updateResults(): void {
 	resultsList.innerHTML = '';
 	resultsSection.hidden = processedFiles.length === 0;
 
-	const oldToggle = resultsSection.querySelector('.results__toggle');
-	if (oldToggle) oldToggle.remove();
+	const oldPagination = resultsSection.querySelector('.pagination');
+	if (oldPagination) oldPagination.remove();
 
-	const displayResults =
-		processedFiles.length > COLLAPSE_THRESHOLD && !resultsExpanded
-			? processedFiles.slice(0, COLLAPSE_THRESHOLD)
-			: processedFiles;
+	const totalPages = Math.max(1, Math.ceil(processedFiles.length / PAGE_SIZE));
+	resultsPage = Math.min(resultsPage, totalPages - 1);
+	const startIndex = resultsPage * PAGE_SIZE;
+	const displayResults = processedFiles.slice(startIndex, startIndex + PAGE_SIZE);
 
 	for (const result of displayResults) {
 		const li = document.createElement('li');
@@ -1112,6 +1145,11 @@ function updateResults(): void {
 
 			li.append(thumb, info, download);
 		} else {
+			const marker = document.createElement('div');
+			marker.className = 'result-item__marker';
+			marker.setAttribute('aria-hidden', 'true');
+			marker.textContent = '!';
+
 			const info = document.createElement('div');
 			info.className = 'result-item__info';
 
@@ -1136,25 +1174,16 @@ function updateResults(): void {
 			status.className = 'result-item__status result-item__status--error';
 			status.textContent = 'Failed';
 
-			li.append(info, status);
+			li.append(marker, info, status);
 		}
 
 		resultsList.append(li);
 	}
 
-	if (processedFiles.length > COLLAPSE_THRESHOLD) {
-		const toggle = document.createElement('button');
-		toggle.className = 'results__toggle';
-		toggle.type = 'button';
-		toggle.textContent = resultsExpanded
-			? 'Show less'
-			: `Show all ${processedFiles.length} results (${processedFiles.length - COLLAPSE_THRESHOLD} more)`;
-		toggle.addEventListener('click', () => {
-			resultsExpanded = !resultsExpanded;
-			updateResults();
-		});
-		resultsSection.append(toggle);
-	}
+	buildPagination(resultsSection, resultsPage, totalPages, (page) => {
+		resultsPage = page;
+		updateResults();
+	});
 
 	downloadAllBtn.disabled = processedFiles.some((r) => r.success) === false;
 }
@@ -1185,7 +1214,7 @@ async function processAllFiles(): Promise<void> {
 
 	processAllBtn.disabled = true;
 	processedFiles = [];
-	resultsExpanded = false;
+	resultsPage = 0;
 	updateResults();
 
 	const options = getProcessingOptions();
@@ -1232,8 +1261,8 @@ function clearAll(): void {
 	}
 	queuedFiles = [];
 	processedFiles = [];
-	fileListExpanded = false;
-	resultsExpanded = false;
+	fileListPage = 0;
+	resultsPage = 0;
 	updateFileList();
 	updateResults();
 	progressSection.hidden = true;
