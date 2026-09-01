@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite';
 import { viteSingleFile } from 'vite-plugin-singlefile';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
@@ -43,5 +44,11 @@ export default defineConfig({
 		outDir: '../dist',
 		emptyOutDir: true,
 		minify: false
+	},
+	test: {
+		// Vite's root is src/, so Vitest would otherwise resolve its default
+		// cache path against the source folder and create a stray
+		// src/node_modules/.vite tree. The suite is fast, so disable caching.
+		cache: false
 	}
 });

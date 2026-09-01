@@ -18,12 +18,12 @@
 
 		<main class="main">
 			<section class="drop-zone" id="drop-zone">
-				<input type="file" id="file-input" class="drop-zone__input" accept="image/*,video/*" multiple
+				<input type="file" id="file-input" class="drop-zone__input" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif,video/mp4,video/webm,video/quicktime,video/x-msvideo,video/x-matroska,video/ogg,.png,.jpg,.jpeg,.webp,.bmp,.gif,.mp4,.webm,.mov,.avi,.mkv,.ogg" multiple
 					aria-label="Upload media files" />
 				<div class="drop-zone__content">
 					<p class="drop-zone__icon" aria-hidden="true">&#128462;</p>
 					<p class="drop-zone__text">Drop media files here or click to browse</p>
-					<p class="drop-zone__hint">PNG, JPEG, WebP, BMP, GIF, MP4, WebM, MOV, AVI</p>
+					<p class="drop-zone__hint">PNG, JPEG, WebP, BMP, GIF, MP4, WebM, MOV, AVI, MKV, OGG</p>
 				</div>
 			</section>
 
@@ -38,39 +38,73 @@
 				<div class="options__grid">
 					<label class="option option--info">
 						<input type="checkbox" id="strip-metadata" checked disabled />
-						<span class="option__label">Strip metadata <span class="option__tag">images &amp;
-								videos</span></span>
+						<span class="option__label">Strip metadata</span>
+						<span class="option__tag">images &amp; videos</span>
 						<span class="option__hint">Always on. Removes image metadata and re-encodes video streams to
 							strip container-level hidden data.</span>
 					</label>
 
 					<label class="option">
 						<input type="checkbox" id="clear-lsb" />
-						<span class="option__label">Clear LSBs <span class="option__tag">images only</span></span>
+						<span class="option__label">Clear LSBs</span>
+						<span class="option__tag">images only</span>
 						<span class="option__hint">Zeros the lowest bit of every RGB value. Invisible to the eye, but
 							removes 1 bit of color precision per channel.</span>
 					</label>
 
 					<label class="option">
 						<input type="checkbox" id="randomize-lsb" />
-						<span class="option__label">Randomize LSBs <span class="option__tag">images only</span></span>
+						<span class="option__label">Randomize LSBs</span>
+						<span class="option__tag">images only</span>
 						<span class="option__hint">Replaces the lowest bit of every RGB value with random noise. The
 							image looks unchanged.</span>
 					</label>
 
 					<label class="option">
 						<input type="checkbox" id="apply-blur" />
-						<span class="option__label">Apply blur <span class="option__tag">images only</span></span>
+						<span class="option__label">Apply blur</span>
+						<span class="option__tag">images only</span>
 						<span class="option__hint">A light box blur that wipes high-frequency steganographic patterns.
 							Slightly softens the image.</span>
 					</label>
 
 					<label class="option">
 						<input type="checkbox" id="jpeg-recompress" />
-						<span class="option__label">JPEG re-compress <span class="option__tag">images only</span></span>
+						<span class="option__label">JPEG re-compress</span>
+						<span class="option__tag">images only</span>
 						<span class="option__hint">Forces JPEG output at the selected quality. Very destructive to
-							hidden data, but lossy; lower quality = smaller files and stronger sanitization.</span>
+							hidden data, but lossy. Lower quality = smaller files and stronger sanitization.</span>
 					</label>
+
+				<div class="option option--expandable">
+					<label class="option__header" for="synthid-attack">
+						<input type="checkbox" id="synthid-attack" />
+						<span class="option__label">Remove SynthID</span>
+						<span class="option__tag">images &amp; videos</span>
+						<span class="option__hint">SynthID is an invisible watermark Google embeds in AI-generated media (e.g. Gemini images and Veo videos). Applies subtle warps and re-encoding that may slightly alter the
+							media. Removal of SynthID is not guaranteed.</span>
+					</label>
+					<div class="option__sub" id="synthid-scope-wrap" hidden>
+						<fieldset class="mode-group" id="synthid-scope-group">
+							<legend class="visually-hidden">SynthID removal scope</legend>
+							<label class="mode-option">
+								<input type="radio" name="synthid-scope" value="detected-no-video" />
+								<span>Only SynthID-detected images, no videos</span>
+							</label>
+							<label class="mode-option">
+								<input type="radio" name="synthid-scope" value="detected" checked />
+								<span>Only SynthID-detected images, all videos</span>
+							</label>
+							<label class="mode-option">
+								<input type="radio" name="synthid-scope" value="all" />
+								<span>All inputs</span>
+							</label>
+						</fieldset>
+					</div>
+					<button type="button" id="synthid-advanced-toggle" class="option__toggle" hidden
+						aria-expanded="false" aria-controls="synthid-settings">Advanced options<span
+							class="option__toggle-caret" aria-hidden="true"></span></button>
+				</div>
 				</div>
 
 				<div class="options__controls">
@@ -88,9 +122,103 @@
 
 				</div>
 
+				<div class="options__group" id="synthid-settings" hidden>
+					<h3 class="options__group-title">Remove SynthID</h3>
+					<p class="control__value" id="synthid-preset-note">Presets mirror the published <a
+							href="https://github.com/aloshdenny/reverse-SynthID" target="_blank"
+							rel="noopener noreferrer">reverse-SynthID attack research</a>. Most image stages run a quality
+						check, except local shifts and rotation which always apply. Video stages use FFmpeg approximations at a fixed MP4 quality without PSNR gating or
+						edge-preserving smoothing, so the re-encode rounds, re-encode quality, quality floor (PSNR),
+						and smoothing settings apply to images only. Luma noise settings that round to zero
+						whole levels are skipped for video (the filter adds integer noise only), and other
+						fractional values are rounded.</p>
+					<fieldset class="mode-group" id="synthid-preset-group">
+						<legend class="visually-hidden">SynthID preset</legend>
+						<label class="mode-option">
+							<input type="radio" name="synthid-preset" value="gentle" />
+							<span>Gentle</span>
+						</label>
+						<label class="mode-option">
+							<input type="radio" name="synthid-preset" value="balanced" checked />
+							<span>Balanced</span>
+						</label>
+						<label class="mode-option">
+							<input type="radio" name="synthid-preset" value="aggressive" />
+							<span>Aggressive</span>
+						</label>
+					</fieldset>
+
+					<div class="options__controls">
+						<div class="control">
+							<label for="synthid-elastic" class="control__label">Local shift strength</label>
+							<input type="range" id="synthid-elastic" min="1" max="4" step="0.1" value="2" />
+							<output class="control__value" id="synthid-elastic-value">2px</output>
+						</div>
+
+						<div class="control">
+							<label for="synthid-sigma" class="control__label">Shift cell size</label>
+							<input type="range" id="synthid-sigma" min="20" max="80" step="1" value="50" />
+							<output class="control__value" id="synthid-sigma-value">50px</output>
+						</div>
+
+						<div class="control">
+							<label for="synthid-rotation" class="control__label">Rotation jitter</label>
+							<input type="range" id="synthid-rotation" min="0" max="3" step="0.05" value="0.75" />
+							<output class="control__value" id="synthid-rotation-value">0.75°</output>
+						</div>
+
+						<div class="control">
+							<label for="synthid-squeeze" class="control__label">Resize squeeze</label>
+							<input type="range" id="synthid-squeeze" min="0.7" max="1" step="0.01" value="1" />
+							<output class="control__value" id="synthid-squeeze-value">1.00×</output>
+						</div>
+
+						<div class="control">
+							<label for="synthid-color" class="control__label">Color shift</label>
+							<input type="range" id="synthid-color" min="0" max="2" step="0.05" value="1" />
+							<output class="control__value" id="synthid-color-value">1.00×</output>
+						</div>
+
+						<div class="control">
+							<label for="synthid-noise" class="control__label">Luma noise</label>
+							<input type="range" id="synthid-noise" min="0" max="5" step="0.1" value="1.5" />
+							<output class="control__value" id="synthid-noise-value">1.5</output>
+						</div>
+
+						<div class="control">
+							<label for="synthid-rounds" class="control__label">Re-encode rounds</label>
+							<input type="range" id="synthid-rounds" min="0" max="4" step="1" value="1" />
+							<output class="control__value" id="synthid-rounds-value">1</output>
+						</div>
+
+						<div class="control">
+							<label for="synthid-quality" class="control__label">Re-encode quality</label>
+							<input type="range" id="synthid-quality" min="60" max="100" step="1" value="92" />
+							<output class="control__value" id="synthid-quality-value">92%</output>
+						</div>
+
+						<div class="control">
+							<label for="synthid-psnr-floor" class="control__label">Quality floor for gated stages (PSNR)</label>
+							<input type="range" id="synthid-psnr-floor" min="10" max="40" step="1" value="32" />
+							<output class="control__value" id="synthid-psnr-floor-value">32 dB</output>
+							<span class="option__hint">Limits the squeeze, color, noise, re-encode, and smoothing stages only. Local shifts and rotation always apply and are not bounded by this value.</span>
+						</div>
+					</div>
+
+					<div class="options__grid">
+						<label class="option">
+							<input type="checkbox" id="synthid-bilateral" />
+							<span class="option__label">Edge-preserving smoothing</span>
+							<span class="option__hint">Bilateral filter pass after re-encoding. Removes residual
+								high-frequency energy while keeping edges sharp.</span>
+						</label>
+					</div>
+				</div>
+
 				<div class="options__group" id="output-formats-group" hidden>
 					<h3 class="options__group-title">Output formats</h3>
 					<p class="control__value" id="output-format-note">Each input type can have its own output format.
+						BMP inputs always re-encode (PNG by default) because canvas cannot export BMP.
 					</p>
 					<div class="options__controls" id="output-format-rows"></div>
 				</div>
@@ -133,7 +261,7 @@
 								<input type="number" id="prefix-start-index" value="0" min="0" step="1" />
 							</div>
 						</div>
-						<span class="control__value">Example: file.png, file1.png, file2.png…</span>
+						<span class="control__value">Example: file0.png, file1.png, file2.png…</span>
 					</div>
 
 					<div class="mode-panel" id="hash-panel" hidden>
@@ -152,7 +280,8 @@
 								<span>Full</span>
 							</label>
 						</fieldset>
-						<span class="control__value">Filename is the SHA-256 of the output bytes.</span>
+						<span class="control__value">Filename is the SHA-256 of the output bytes, or a local fingerprint when
+							secure hashing is unavailable.</span>
 					</div>
 				</div>
 			</section>
