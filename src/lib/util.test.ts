@@ -13,13 +13,17 @@ import {
 	getHashLength,
 	getMimeFromExtension,
 	getOutputMime,
+	isContentDigest,
 	isFallbackHash,
 	isSupportedFile,
 	isVideoFile,
+	LARGE_INPUT_BYTES,
 	parseInteger,
 	parseNumber,
 	routesToVideo,
+	sha256HexFromBuffer,
 } from './util';
+import { SCAN_WINDOW_BYTES } from './synthid-metadata';
 import type { ProcessingOptions } from './types';
 
 function fakeFile(name: string, type: string): File {
@@ -34,7 +38,7 @@ function baseOptions(overrides: Partial<ProcessingOptions> = {}): ProcessingOpti
 		blurRadius: 1,
 		jpegRecompress: false,
 		jpegQuality: 85,
-		synthid: {
+		distort: {
 			enabled: false,
 			elasticAlpha: 0,
 			elasticSigma: 50,
@@ -42,12 +46,12 @@ function baseOptions(overrides: Partial<ProcessingOptions> = {}): ProcessingOpti
 			squeezeFactor: 1,
 			colorAmount: 0,
 			lumaNoise: 0,
+			lumaNoiseStep: 0.1,
 			reencodeRounds: 0,
 			reencodeQuality: 88,
 			bilateral: false,
 			psnrFloor: 24,
 		},
-		synthidScope: 'all',
 		outputFormats: {},
 		filenameMode: 'suffix',
 		outputSuffix: '-clean',
@@ -319,6 +323,53 @@ describe('computeSha256', () => {
 	it('distinguishes fallback fingerprints from SHA-256 digests', () => {
 		expect(isFallbackHash('fnv1a-0123abcd')).toBe(true);
 		expect(isFallbackHash('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')).toBe(false);
+	});
+});
+
+describe('sha256HexFromBuffer', () => {
+	it('agrees with computeSha256 on the same bytes', async () => {
+		// The pre-flight digests a buffer it read for another reason, so the two
+		// entry points must produce the same key or a file's content key would
+		// depend on which caller hashed it.
+		const bytes = new TextEncoder().encode('the quick brown fox');
+		await expect(sha256HexFromBuffer(bytes.buffer as ArrayBuffer))
+			.resolves.toBe(await computeSha256(new Blob([bytes])));
+	});
+
+	it('falls back to the same prefixed fingerprint without crypto.subtle', async () => {
+		const realCrypto = globalThis.crypto;
+		vi.stubGlobal('crypto', undefined);
+		try {
+			const bytes = new TextEncoder().encode('abc');
+			const digest = await sha256HexFromBuffer(bytes.buffer as ArrayBuffer);
+			expect(digest).toMatch(/^fnv1a-[0-9a-f]{16}$/);
+			await expect(sha256HexFromBuffer(bytes.buffer as ArrayBuffer)).resolves.toBe(digest);
+		} finally {
+			vi.stubGlobal('crypto', realCrypto);
+		}
+	});
+});
+
+describe('isContentDigest', () => {
+	it('accepts a SHA-256 digest as a cache key', () => {
+		expect(isContentDigest('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')).toBe(true);
+	});
+
+	it('rejects the non-cryptographic fallback fingerprint', () => {
+		// The fallback is not collision-resistant, so a declaration cached
+		// under one could belong to a different file.
+		expect(isContentDigest('fnv1a-0123abcd0123abcd')).toBe(false);
+	});
+});
+
+describe('LARGE_INPUT_BYTES', () => {
+	it('sits above the total the bounded declaration scan can read', () => {
+		// Above this size nothing is digested eagerly, which only pays off
+		// while the bounded scan reads less than a digest of the whole file
+		// would. Asserting against the scanner's own exported total rather
+		// than restating it here is what makes the two stay in step when a
+		// window grows.
+		expect(LARGE_INPUT_BYTES).toBeGreaterThan(SCAN_WINDOW_BYTES);
 	});
 });
 

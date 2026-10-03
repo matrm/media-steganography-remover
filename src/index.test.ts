@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { GifReader, GifWriter } from 'omggif';
-import type { ProcessingOptions, SynthidDetection } from './lib/types';
-import { SYNTHID_PRESETS, isSubLevelVideoNoise, subLevelVideoNoiseWarning } from './lib/synthid';
+import type { ProcessingOptions } from './lib/types';
+import { DISTORT_PRESETS, isSubLevelVideoNoise, subLevelVideoNoiseWarning } from './lib/distort';
+import { LARGE_INPUT_BYTES } from './lib/util';
 
 const mocks = vi.hoisted(() => ({
 	instances: [] as Array<{
@@ -15,16 +16,15 @@ const mocks = vi.hoisted(() => ({
 	load: vi.fn(),
 	write: vi.fn(),
 	exec: vi.fn(),
-	detect: vi.fn(),
 	zip: vi.fn(),
 	background: vi.fn(),
 	decode: vi.fn(),
 	reader: vi.fn(),
+	declarationScan: vi.fn(),
 	gifSize: null as null | { width: number; height: number; frames: number },
 }));
 
 vi.mock('./style.css', () => ({}));
-vi.mock('./lib/synthid-detect', () => ({ detectSynthid: mocks.detect }));
 vi.mock('@ffmpeg/ffmpeg', () => ({
 	FFmpeg: class {
 		load = vi.fn(() => mocks.load());
@@ -67,6 +67,19 @@ vi.mock('./lib/quantize', async (importOriginal) => {
 		mocks.background();
 		return actual.getGifBackground(...args);
 	} };
+});
+// The declaration search is wrapped so a test can count how many times a file's
+// bytes were examined, which is the only externally visible difference between
+// a cache hit and a fresh search once both callers read their own file to
+// derive a content key. The real implementation is passed through, so the badge
+// still reflects the file's actual contents.
+vi.mock('./lib/synthid-metadata', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('./lib/synthid-metadata')>();
+	return {
+		...actual,
+		hasSynthidDeclarationInBytes: (bytes: Uint8Array) =>
+			mocks.declarationScan(bytes, actual.hasSynthidDeclarationInBytes),
+	};
 });
 
 class Element {
@@ -144,13 +157,9 @@ const node = (id: string) => {
 };
 const options = (): ProcessingOptions => ({
 	clearLsb: false, randomizeLsb: false, applyBlur: false, blurRadius: 0,
-	jpegRecompress: false, jpegQuality: 85,
-	synthid: { ...SYNTHID_PRESETS.balanced, enabled: false }, synthidScope: 'detected',
+	jpegRecompress: false, jpegQuality: 85, distort: { ...DISTORT_PRESETS.balanced, enabled: false, lumaNoiseStep: 0.1 },
 	outputFormats: {}, filenameMode: 'suffix', outputSuffix: '-clean', outputPrefix: 'file', prefixStartIndex: 0, hashLength: 32,
 });
-const verdict: SynthidDetection = {
-	isWatermarked: true, confidence: 0.9, phaseMatch: 0.8, profileKey: 'test-profile', exactMatch: true, conclusive: true,
-};
 function gif(transparent = false): File {
 	const bytes = new Uint8Array(1024);
 	const writer = new GifWriter(bytes, 1, 1, { palette: [0, 0xffffff] });
@@ -163,6 +172,11 @@ function drop(...files: File[]) {
 	node('drop-zone').dispatchEvent(event);
 }
 const video = () => new File(['video input'], 'clip.mp4', { type: 'video/mp4' });
+// crypto.subtle is a shared global, so a spy installed before anything a
+// previous test left in flight settles would record that straggler too.
+// Crossing a macrotask boundary first lets it finish where no spy can see
+// it, so an exact count below measures only this test's own work.
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 beforeEach(async () => {
 	vi.resetModules();
@@ -172,10 +186,12 @@ beforeEach(async () => {
 	mocks.load.mockReset().mockResolvedValue(true);
 	mocks.write.mockReset().mockResolvedValue(undefined);
 	mocks.exec.mockReset().mockResolvedValue(0);
-	mocks.detect.mockReset().mockResolvedValue(verdict);
 	mocks.zip.mockReset().mockRejectedValue(new Error('ZIP allocation failed'));
 	mocks.background.mockReset();
 	mocks.decode.mockReset().mockImplementation(() => { throw new Error('decode must not run'); });
+	mocks.declarationScan.mockReset().mockImplementation(
+		async (bytes: Uint8Array, scan: (bytes: Uint8Array) => boolean) => scan(bytes)
+	);
 	elements = new Map();
 	vi.stubGlobal('document', {
 		getElementById: node,
@@ -213,15 +229,10 @@ describe('FFmpeg lifecycle and transferred input', () => {
 		expect(output.warnings.some((warning) => warning.includes('discards transparency'))).toBe(transparent);
 	});
 
-	it('reports the cached input verdict for a still image routed through FFmpeg', async () => {
-		const output = await app.processVideo(gif(), options(), undefined, verdict);
-		expect(output.synthidCheck).toEqual({ input: verdict, output: null });
-	});
-
 	it('retains warnings in the caller collector when the video path fails', async () => {
 		mocks.write.mockRejectedValueOnce(new Error('write failed'));
 		const warnings: string[] = [];
-		await expect(app.processVideo(gif(true), options(), undefined, null, warnings)).rejects.toThrow('write failed');
+		await expect(app.processVideo(gif(true), options(), undefined, warnings)).rejects.toThrow('write failed');
 		expect(warnings.some((warning) => warning.includes('discards transparency'))).toBe(true);
 	});
 
@@ -247,8 +258,8 @@ describe('FFmpeg lifecycle and transferred input', () => {
 
 	it('retains filter-builder warnings when metadata is unavailable', async () => {
 		const config = options();
-		config.synthid.enabled = true;
-		config.synthid.squeezeFactor = 0.9;
+		config.distort.enabled = true;
+		config.distort.squeezeFactor = 0.9;
 		const output = await app.processVideo(video(), config);
 		expect(output.warnings).toContain('Rotation jitter was skipped: original frame dimensions are unavailable.');
 		expect(output.warnings).toContain('Resize squeeze was skipped: original frame dimensions are unavailable.');
@@ -256,23 +267,21 @@ describe('FFmpeg lifecycle and transferred input', () => {
 
 	it('reports the metadata-only fallback when the filter-less retry succeeds', async () => {
 		const config = options();
-		config.synthid = { ...config.synthid, enabled: true };
-		config.synthidScope = 'all';
+		config.distort = { ...config.distort, enabled: true };
 		const warnings: string[] = [];
 		mocks.exec.mockResolvedValueOnce(1).mockResolvedValueOnce(0);
-		const output = await app.processVideo(video(), config, undefined, null, warnings);
+		const output = await app.processVideo(video(), config, undefined, warnings);
 		expect(output.blob.type).toBe('video/mp4');
 		expect(mocks.exec).toHaveBeenCalledTimes(2);
-		expect(warnings).toContain('The video SynthID filter chain failed for this file. Metadata stripping was applied without the SynthID stages.');
+		expect(warnings).toContain('The video distortion filter chain failed for this file. Metadata stripping was applied without the distortion stages.');
 	});
 
 	it('does not claim the metadata-only fallback when both attempts fail', async () => {
 		const config = options();
-		config.synthid = { ...config.synthid, enabled: true };
-		config.synthidScope = 'all';
+		config.distort = { ...config.distort, enabled: true };
 		const warnings: string[] = [];
 		mocks.exec.mockResolvedValueOnce(1).mockResolvedValueOnce(1);
-		await expect(app.processVideo(video(), config, undefined, null, warnings)).rejects.toThrow('FFmpeg exited with code 1');
+		await expect(app.processVideo(video(), config, undefined, warnings)).rejects.toThrow('FFmpeg exited with code 1');
 		expect(mocks.exec).toHaveBeenCalledTimes(2);
 		expect(warnings.some((warning) => warning.includes('Metadata stripping was applied'))).toBe(false);
 	});
@@ -294,8 +303,7 @@ describe('FFmpeg lifecycle and transferred input', () => {
 
 	it('advises a video luma noise level that actually applies', async () => {
 		const config = options();
-		config.synthid = { ...config.synthid, enabled: true, lumaNoise: 0.5 };
-		config.synthidScope = 'all';
+		config.distort = { ...config.distort, enabled: true, lumaNoise: 0.5 };
 		const output = await app.processVideo(video(), config);
 		const warning = output.warnings.find((entry) => entry.includes('Luma noise was skipped'));
 		expect(warning).toBeDefined();
@@ -309,7 +317,7 @@ describe('FFmpeg lifecycle and transferred input', () => {
 		// two sides together, so a coarser step or a max below the threshold
 		// fails loudly instead of leaving unselectable advice.
 		const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
-		const input = /<input type="range" id="synthid-noise"[^>]*>/.exec(html)![0];
+		const input = /<input type="range" id="distort-noise"[^>]*>/.exec(html)![0];
 		const step = Number.parseFloat(/step="([0-9.]+)"/.exec(input)![1]);
 		const max = Number.parseFloat(/max="([0-9.]+)"/.exec(input)![1]);
 		const advised = Number.parseFloat(/at least ([0-9.]+)/.exec(subLevelVideoNoiseWarning(step))![1]);
@@ -410,6 +418,46 @@ describe('queue controls', () => {
 		await running;
 	});
 
+	it('locks the whole options panel for the duration of a batch', async () => {
+		// A batch reads the options once at its start, so every option control
+		// and the declaration badge lock together. Leaving any of them live
+		// would accept a change that only takes effect on the next run, which
+		// reads as a control that ignored the user.
+		const lock = node('options-lock') as unknown as HTMLFieldSetElement;
+		expect(lock.disabled).toBe(false);
+		drop(new File(
+			[new TextEncoder().encode('header bytes Applied imperceptible SynthID watermark trailing bytes')],
+			'marked.png',
+			{ type: 'image/png' }
+		));
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item__synthid')).not.toBeNull());
+		const running = app.processAllFiles();
+		expect(lock.disabled).toBe(true);
+		expect(node('file-list').querySelector('.file-item__synthid')!.disabled).toBe(true);
+		await running;
+		expect(lock.disabled).toBe(false);
+		expect(node('file-list').querySelector('.file-item__synthid')!.disabled).toBe(false);
+	});
+
+	it('unlocks the options panel even when a batch fails', async () => {
+		// The lock opens from the batch's cleanup path, so a failure part way
+		// through must still release it or every option stays inert for the rest
+		// of the session.
+		const lock = node('options-lock') as unknown as HTMLFieldSetElement;
+		drop(video());
+		const group = node('filename-mode-group');
+		const original = group.querySelector.bind(group);
+		let reads = 0;
+		vi.spyOn(group, 'querySelector').mockImplementation((selector: string) => {
+			reads += 1;
+			if (reads > 1) throw new Error('setup failed');
+			return original(selector);
+		});
+		await app.processAllFiles().catch(() => {});
+		expect(node('progress-text').textContent).toContain('setup failed');
+		expect(lock.disabled).toBe(false);
+	});
+
 	it('keeps Process All and Clear All locked while ZIP generation is running', async () => {
 		drop(video());
 		await app.processAllFiles();
@@ -424,81 +472,323 @@ describe('queue controls', () => {
 	});
 });
 
-describe('output verification', () => {
-	it('retains the input verdict and adds a warning when output decoding fails', async () => {
-		const warnings: string[] = [];
-		const result = await app.verifyOutputSynthid(new Blob(['output']), options().synthid, verdict, warnings, 'output-hash');
-		expect(result).toEqual({ input: verdict, output: null });
-		expect(warnings.join(' ')).toMatch(/output.*verification.*failed/i);
+describe('SynthID declaration badge', () => {
+	// The badge reports what Google wrote into the file's own metadata, not a
+	// measurement of the watermark in the pixels.
+	const marked = () => new File(
+		[new TextEncoder().encode('header bytes Applied imperceptible SynthID watermark trailing bytes')],
+		'marked.png',
+		{ type: 'image/png' }
+	);
+
+	it('names what it found and where that came from', () => {
+		const badge = app.createSynthidBadge();
+		// The label reports a declaration, not a measurement, so it must not
+		// claim the watermark was detected.
+		expect(badge.textContent).toBe('SynthID declared');
+		expect(badge.textContent).not.toMatch(/detected/i);
+		// Says plainly that it reports the file's declaration, not a
+		// measurement of the pixels.
+		expect(badge.title).toMatch(/not a measurement of the watermark in the pixels/i);
+		// Names the option it actually turns on.
+		expect(badge.title).toMatch(/media distortion/i);
+		// The option covers the whole batch, so the per-file badge must not read
+		// as a per-file action.
+		expect(badge.title).toMatch(/all inputs/i);
+		// Claims no removal, since nothing here measures whether a watermark
+		// survived the distortion.
+		expect(badge.title).toMatch(/not verified to remove/i);
 	});
 
-	it('renders missing output as unavailable, never as not detected', () => {
-		const info = new Element();
-		app.appendSynthidVerdict(info as unknown as HTMLElement, { input: verdict, output: null });
-		expect(info.children[0].textContent).toContain('input detected (90%)');
-		expect(info.children[0].textContent).toContain('output unavailable');
-		expect(info.children[0].title).toContain('output unavailable');
-		expect(info.children[0].classList.contains('result-item__synthid--flagged')).toBe(false);
+	it('turns the distortion option on when clicked', () => {
+		const input = node('distort-attack') as unknown as HTMLInputElement;
+		input.checked = false;
+		app.createSynthidBadge().click();
+		expect(input.checked).toBe(true);
 	});
 
-	it('renders an unverifiable size as inconclusive instead of shaky percentages', () => {
-		const info = new Element();
-		const inconclusive: SynthidDetection = { ...verdict, conclusive: false, confidence: 0.53 };
-		app.appendSynthidVerdict(info as unknown as HTMLElement, { input: inconclusive, output: { ...inconclusive, confidence: 0.57 } });
-		expect(info.children[0].textContent).toContain('input inconclusive (size too small)');
-		expect(info.children[0].textContent).toContain('output inconclusive (size too small)');
-		expect(info.children[0].textContent).not.toContain('%');
-		expect(info.children[0].title).toContain('input test-profile (size too small for a trusted check)');
-		expect(info.children[0].classList.contains('result-item__synthid--flagged')).toBe(false);
+	it('badges a declaring file without changing the user\'s options', async () => {
+		// The badge is informational. What the metadata claims is not evidence
+		// that the pixels carry a watermark this tool can affect, so adding a
+		// file must never turn an option on for the user. Clicking the badge is
+		// how they ask for the distortion, which the test above covers.
+		const input = node('distort-attack') as unknown as HTMLInputElement;
+		input.checked = false;
+		drop(marked());
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item__synthid')).not.toBeNull());
+		expect(input.checked).toBe(false);
+		expect(node('file-list').querySelector('.file-item__synthid')!.textContent).toBe('SynthID declared');
 	});
 
-	it('does not warn about a still-detectable output when the size cannot be verified', async () => {
-		const warnings: string[] = [];
-		const inconclusive: SynthidDetection = { ...verdict, conclusive: false, confidence: 0.53 };
-		mocks.detect.mockResolvedValue(inconclusive);
-		const result = await app.verifyOutputSynthid(gif(), { ...options().synthid, enabled: true }, inconclusive, warnings, 'output-hash');
-		expect(result).toEqual({ input: inconclusive, output: inconclusive });
-		expect(warnings).toEqual([]);
+	it('badges a declaring video as well as a still image', async () => {
+		// The pre-flight is a bounded byte search over the container's edges, so
+		// it reads any supported format without decoding. Leaving videos out
+		// would hide the declaration on exactly the AI-generated media most
+		// likely to carry one.
+		drop(new File(
+			[new TextEncoder().encode('ftypbrand Applied imperceptible SynthID watermark moovdata')],
+			'clip.mp4',
+			{ type: 'video/mp4' }
+		));
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item__synthid')).not.toBeNull());
+		expect(node('file-list').querySelector('.file-item__synthid')!.textContent).toBe('SynthID declared');
+	});
+
+	it('badges nothing and changes nothing for a file with no declaration', async () => {
+		const input = node('distort-attack') as unknown as HTMLInputElement;
+		input.checked = false;
+		drop(new File([new TextEncoder().encode('plain content')], 'plain.png', { type: 'image/png' }));
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item')).not.toBeNull());
+		expect(input.checked).toBe(false);
+		expect(node('file-list').querySelector('.file-item__synthid')).toBeNull();
+	});
+
+	it('keeps exactly one badge for a declaring file after the list re-renders', async () => {
+		// Two render paths can add the badge: the incremental update once the
+		// pre-flight resolves, and the full rebuild updateFileList runs on every
+		// queue mutation. Both read the same stored declaration, so the second
+		// must refresh the badge rather than stack a duplicate.
+		drop(marked());
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item__synthid')).not.toBeNull());
+		drop(new File([new TextEncoder().encode('plain content')], 'plain.png', { type: 'image/png' }));
+		const badges = node('file-list').querySelectorAll('.file-item__synthid');
+		expect(badges).toHaveLength(1);
+		expect(badges[0].textContent).toBe('SynthID declared');
+	});
+
+	it('reads each queued file once and shares the declaration between identical copies', async () => {
+		// A small input is read whole to derive its content key, and that same
+		// buffer is searched for the declaration, so one read answers both. The
+		// second copy cannot skip its own read, since it needs the same key, but
+		// it must reuse the first copy's declaration rather than searching again.
+		await settle();
+		// A scan the previous test queued can still land after the beforeEach
+		// reset, so the count is cleared again now that nothing is in flight.
+		mocks.declarationScan.mockClear();
+		const read = vi.spyOn(Blob.prototype, 'arrayBuffer');
+		const slice = vi.spyOn(Blob.prototype, 'slice');
+		drop(marked());
+		await vi.waitFor(() => expect(node('file-list').querySelectorAll('.file-item__synthid')).toHaveLength(1));
+		drop(new File(
+			[new TextEncoder().encode('header bytes Applied imperceptible SynthID watermark trailing bytes')],
+			'copy.png',
+			{ type: 'image/png' }
+		));
+		await vi.waitFor(() => expect(node('file-list').querySelectorAll('.file-item__synthid')).toHaveLength(2));
+		// One read per file, and no windowed read at all: the small-input path
+		// searches the buffer it already has rather than slicing the blob again.
+		expect(read).toHaveBeenCalledTimes(2);
+		expect(slice).not.toHaveBeenCalled();
+		expect(mocks.declarationScan).toHaveBeenCalledTimes(1);
+	});
+
+	it('badges a large input without ever reading the whole file', async () => {
+		// A large input is not digested up front, because hashing it would
+		// materialize the entire file just to scan its container edges. The
+		// scan must stay bounded and the input must still be badged, so this
+		// pins both halves of that tradeoff. The marker sits in the trailing
+		// window, the layout a non-faststart MP4 uses, so the scan has to read
+		// both ends rather than stopping early.
+		const digest = vi.spyOn(crypto.subtle, 'digest');
+		const slice = vi.spyOn(Blob.prototype, 'slice');
+		const marker = new TextEncoder().encode('Applied imperceptible SynthID watermark');
+		const bytes = new Uint8Array(LARGE_INPUT_BYTES);
+		bytes.set(marker, LARGE_INPUT_BYTES - marker.length - 8);
+		const sparse = new File([bytes], 'huge.png', { type: 'image/png' });
+		drop(sparse);
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item__synthid')).not.toBeNull());
+		// The badge is the scan's last step, so its appearing also means the
+		// digest decision has already been made and no digest is still to
+		// arrive on this spy.
+		expect(digest).not.toHaveBeenCalled();
+		// The whole-file read the small-input path takes is absent, so the
+		// windows below are the only reads there are.
+		expect(mocks.declarationScan).not.toHaveBeenCalled();
+		// One window per end, and each a fraction of the file, so the payload
+		// between them is never read.
+		expect(slice).toHaveBeenCalledTimes(2);
+		for (const [start, end] of slice.mock.calls as [number, number][]) {
+			expect(end - start).toBeLessThan(sparse.size);
+		}
+	});
+
+	it('searches duplicate bytes again when no trustworthy content key exists', async () => {
+		// Without crypto.subtle the digest degrades to a non-cryptographic
+		// fingerprint, which can collide, so a declaration must never be
+		// cached under it. Two copies of the same bytes are therefore each
+		// searched, where a real digest would have collapsed them into one.
+		// Both still get badged, since bypassing the cache must not cost the
+		// result.
+		vi.stubGlobal('crypto', undefined);
+		drop(marked());
+		await vi.waitFor(() => expect(node('file-list').querySelectorAll('.file-item__synthid')).toHaveLength(1));
+		drop(new File(
+			[new TextEncoder().encode('header bytes Applied imperceptible SynthID watermark trailing bytes')],
+			'copy.png',
+			{ type: 'image/png' }
+		));
+		await vi.waitFor(() => expect(node('file-list').querySelectorAll('.file-item__synthid')).toHaveLength(2));
+		expect(mocks.declarationScan).toHaveBeenCalledTimes(2);
+	});
+
+	it('parks a queued pre-flight while a batch runs and resumes it after', async () => {
+		// Processing and the pre-flight both read files, so the scan must not
+		// interleave with the pipeline. Dropping an image and starting the batch
+		// in the same tick parks the scan behind the gate; the badge must still
+		// appear once the batch releases it, or the file stays unbadged forever.
+		drop(marked());
+		const running = app.processAllFiles();
+		// Nothing has had a chance to run yet, so no scan can have completed.
+		expect(node('file-list').querySelector('.file-item__synthid')).toBeNull();
+		await running;
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item__synthid')).not.toBeNull());
+	});
+
+	it('releases a parked pre-flight even when the batch fails', async () => {
+		// The gate is opened from the batch's cleanup path, so a batch that
+		// throws part way through must still release it. Otherwise the failure
+		// strands every scan queued behind it and their badges never appear,
+		// with nothing on screen to say why.
+		drop(marked());
+		// The batch reads the options twice: once to relock the queue controls
+		// and once for itself. Failing only the second call puts the failure
+		// after the gate closed, which is the ordering under test.
+		const group = node('filename-mode-group');
+		const original = group.querySelector.bind(group);
+		let reads = 0;
+		vi.spyOn(group, 'querySelector').mockImplementation((selector: string) => {
+			reads += 1;
+			if (reads > 1) throw new Error('setup failed');
+			return original(selector);
+		});
+		await app.processAllFiles().catch(() => {});
+		expect(node('progress-text').textContent).toContain('setup failed');
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item__synthid')).not.toBeNull());
+	});
+
+	it('never reads a file removed while its scan waited its turn', async () => {
+		// Scans are serialized, so a file can sit queued behind a slower one and
+		// be discarded in the meantime. Reading it then would spend a read on a
+		// file the user already threw away. The two files differ so neither can
+		// be answered from the other's cached declaration.
+		const declaring = (fill: string) => new File(
+			[new TextEncoder().encode(`${fill} Applied imperceptible SynthID watermark tail`)],
+			'marked.png',
+			{ type: 'image/png' }
+		);
+		const original = Blob.prototype.arrayBuffer;
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => { release = resolve; });
+		const scan = vi.spyOn(Blob.prototype, 'arrayBuffer').mockImplementation(async function (this: Blob) {
+			await held;
+			return original.apply(this);
+		});
+
+		drop(declaring('kept'), declaring('discarded'));
+		// Only the first file's scan has started, and it is parked mid-read.
+		await vi.waitFor(() => expect(scan).toHaveBeenCalledTimes(1));
+		node('file-list').querySelectorAll('.file-item__remove')[1].click();
+		expect(node('file-count').textContent).toBe('1');
+		release();
+
+		// The surviving file's badge proves the queue moved on, so the read
+		// count below is measuring the discarded file rather than a stall.
+		await vi.waitFor(() => expect(node('file-list').querySelectorAll('.file-item__synthid')).toHaveLength(1));
+		await settle();
+		expect(scan).toHaveBeenCalledTimes(1);
+	});
+
+	it('locks the badge while a batch runs, since the options are already captured', async () => {
+		// The batch reads the options once at the start, so a badge clicked
+		// mid-batch would only affect the next run, which reads as a control
+		// that did nothing. It locks with the rest of the queue controls.
+		drop(marked());
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item__synthid')).not.toBeNull());
+		expect(node('file-list').querySelector('.file-item__synthid')!.disabled).toBe(false);
+		const running = app.processAllFiles();
+		expect(node('file-list').querySelector('.file-item__synthid')!.disabled).toBe(true);
+		await running;
+		expect(node('file-list').querySelector('.file-item__synthid')!.disabled).toBe(false);
+	});
+
+	it('leaves a file unbadged and still queued when the metadata read fails', async () => {
+		// The pre-flight is additive, so a read failure must not reject, drop the
+		// file from the queue, or surface as a broken list. Swallow it at the
+		// read both the content key and the search come from.
+		const slice = vi.spyOn(Blob.prototype, 'arrayBuffer').mockRejectedValue(new Error('read failed'));
+		drop(marked());
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item')).not.toBeNull());
+		expect(node('file-count').textContent).toBe('1');
+		expect(node('file-list').querySelector('.file-item__synthid')).toBeNull();
+		slice.mockRestore();
+		// The declaration stays unset across a later rebuild rather than the
+		// file being re-scanned behind the user's back.
+		drop(new File([new TextEncoder().encode('plain content')], 'plain.png', { type: 'image/png' }));
+		expect(node('file-count').textContent).toBe('2');
+		expect(node('file-list').querySelectorAll('.file-item__synthid')).toHaveLength(0);
 	});
 });
 
-describe('SynthID verdict reporting', () => {
-	it('omits the verdict when a detected-scope input is clean', async () => {
-		const config = options();
-		config.synthid = { ...config.synthid, enabled: true };
-		mocks.detect.mockResolvedValue({ ...verdict, isWatermarked: false, confidence: 0.41 });
-		const output = await app.processAnimatedGif(gif(), config, 'clean-gif');
-		expect(output.synthidCheck).toBeUndefined();
+describe('content hash reuse', () => {
+	// The pre-flight is only observable through the badge, so these use a
+	// declaring file: the badge appears exactly when the pre-flight has
+	// finished, which pins the digest count without racing the queue.
+	const marked = () => new File(
+		[new TextEncoder().encode('header bytes Applied imperceptible SynthID watermark trailing bytes')],
+		'marked.png',
+		{ type: 'image/png' }
+	);
+
+	it('reuses the pre-flight digest instead of re-reading the file when processing', async () => {
+		drop(marked());
+		// The badge is the pre-flight's last step, so its appearance pins the
+		// digest the pre-flight took without racing the serial queue.
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item__synthid')).not.toBeNull());
+		await settle();
+		const digest = vi.spyOn(crypto.subtle, 'digest');
+		await app.processAllFiles();
+		// The input is already hashed, so processing must not digest it again.
+		// The static image path cannot decode without a browser, so it fails
+		// after the hash step; the empty spy proves the re-read never happened.
+		expect(digest).not.toHaveBeenCalled();
 	});
 
-	it('reports the verdict when the attack ran', async () => {
-		const config = options();
-		config.synthid = { ...config.synthid, enabled: true };
-		mocks.detect.mockResolvedValue(verdict);
-		const output = await app.processAnimatedGif(gif(), config, 'flagged-gif');
-		expect(output.synthidCheck).toEqual({ input: verdict, output: verdict });
+	it('digests an input whose pre-flight scan had not run yet', async () => {
+		// Control for the assertion above, so a clean pass there cannot come
+		// from a spy that records nothing. A video dropped and processed in the
+		// same tick has its scan park behind the batch gate, so processing is
+		// what hashes it.
+		await settle();
+		const digest = vi.spyOn(crypto.subtle, 'digest');
+		drop(video());
+		await app.processAllFiles();
+		expect(digest).toHaveBeenCalled();
 	});
 });
 
 describe('GIF allocation admission', () => {
-	it.each(['processing', 'detection', 'preflight'])('rejects excessive total GIF pixels before background allocation or decoding in %s', async (path) => {
+	it('rejects excessive total GIF pixels before background allocation or decoding', async () => {
 		mocks.gifSize = { width: 512, height: 512, frames: 256 };
 		mocks.background.mockImplementation(() => { throw new Error('background must not allocate'); });
-		const file = gif();
-		if (path === 'processing') {
-			await expect(app.processAnimatedGif(file, options(), 'large-gif')).rejects.toThrow(/GIF output.*limit/);
-		} else if (path === 'detection') {
-			await expect(app.detectBlobSynthid(file)).rejects.toThrow(/GIF output.*limit/);
-		} else {
-			drop(file);
-			await vi.waitFor(() => expect(mocks.reader).toHaveBeenCalledOnce());
-			await app.processAllFiles();
-			expect(node('results-list').querySelector('.result-item__meta')!.textContent).toMatch(/GIF output.*limit/);
-		}
-		if (path === 'processing') expect(mocks.reader).toHaveBeenCalledOnce();
+		await expect(app.processAnimatedGif(gif(), options())).rejects.toThrow(/GIF output.*limit/);
+		expect(mocks.reader).toHaveBeenCalledOnce();
 		expect(mocks.background).not.toHaveBeenCalled();
 		expect(mocks.decode).not.toHaveBeenCalled();
-		expect(mocks.detect).not.toHaveBeenCalled();
+	});
+
+	it('never decodes a GIF during the pre-flight metadata scan', async () => {
+		// The pre-flight reads the file's declaration from a bounded prefix and
+		// nothing more, so it cannot allocate on an oversized animation no
+		// matter how the file was added. The limit is still enforced, by the
+		// processing path, and surfaces in the result the same way.
+		mocks.gifSize = { width: 512, height: 512, frames: 256 };
+		mocks.background.mockImplementation(() => { throw new Error('background must not allocate'); });
+		drop(gif());
+		await vi.waitFor(() => expect(node('file-list').querySelector('.file-item')).not.toBeNull());
+		expect(mocks.reader).not.toHaveBeenCalled();
+		expect(mocks.background).not.toHaveBeenCalled();
+		await app.processAllFiles();
+		expect(node('results-list').querySelector('.result-item__meta')!.textContent).toMatch(/GIF output.*limit/);
 	});
 });
 
@@ -512,7 +802,7 @@ describe('animated GIF palette randomization', () => {
 
 		const config = options();
 		config.randomizeLsb = true;
-		const output = await app.processAnimatedGif(file, config, 'palette-hash');
+		const output = await app.processAnimatedGif(file, config);
 
 		const reader = new GifReader(new Uint8Array(await output.blob.arrayBuffer()));
 		expect(reader.numFrames()).toBe(2);

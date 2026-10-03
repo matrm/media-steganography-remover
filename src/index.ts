@@ -3,14 +3,10 @@ import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { GifReader, GifWriter } from 'omggif';
 import JSZip from 'jszip';
 import type {
-	Bitmap,
+	DistortPreset,
 	FrameSize,
 	ProcessingOptions,
 	ProcessingOutput,
-	SynthidCheckResult,
-	SynthidDetection,
-	SynthidOptions,
-	SynthidPreset,
 } from './lib/types';
 import {
 	cleanedFileName,
@@ -24,18 +20,20 @@ import {
 	getOutputMime,
 	routesToVideo,
 	VIDEO_OUTPUT_PROFILE,
+	isContentDigest,
 	isFallbackHash,
 	isSupportedFile,
 	isVideoFile,
+	LARGE_INPUT_BYTES,
 	parseInteger,
 	parseNumber,
 	readFileAsArrayBuffer,
+	sha256HexFromBuffer,
 	yieldToBrowser,
-	canvasToBlob,
 	computeSha256,
 	createSeededRandom,
 } from './lib/util';
-import { applyBlurEffect, applyLsbEffect, boxFilter, resampleSeparable } from './lib/pixels';
+import { applyBlurEffect, applyLsbEffect } from './lib/pixels';
 import {
 	GIF_DEFAULT_MAX_COLORS,
 	applyPaletteLsb,
@@ -45,30 +43,22 @@ import {
 	quantizeImageToPalette,
 } from './lib/quantize';
 import { applyGifFrameDisposal } from './lib/gif';
-import { createDetectionCache } from './lib/detection-cache';
 import {
-	MAX_DETECT_DIMENSION,
-	MAX_SYNTHID_GIF_PIXELS,
-	MAX_SYNTHID_IMAGE_PIXELS,
-	SYNTHID_PRESETS,
-	SYNTHID_RETRY_ATTEMPTS,
-	applySynthidDistortionStages,
-	applySynthidPipeline,
-	applySynthidSmoothingStage,
-	buildSynthidRandomState,
-	buildSynthidVideoFilters,
+	MAX_GIF_PIXELS,
+	MAX_DISTORT_PIXELS,
+	DISTORT_PRESETS,
+	applyDistortStages,
+	applyDistortPipeline,
+	applyDistortSmoothingStage,
+	buildDistortRandomState,
+	buildDistortVideoFilters,
 	encodeStaticImage,
-	gateSynthidByDetection,
-	gateVideoSynthid,
 	gifQualityToMaxColors,
 	isSubLevelVideoNoise,
-	selectGifCheckIndices,
-	shouldRestoreBestDraw,
-	shouldRetrySynthidAttempt,
 	subLevelVideoNoiseWarning,
-} from './lib/synthid';
-import { detectSynthid } from './lib/synthid-detect';
-import { hasSynthidManifest } from './lib/synthid-metadata';
+} from './lib/distort';
+import { hasSynthidDeclarationInBytes, hasSynthidManifest } from './lib/synthid-metadata';
+import { createDeclarationCache } from './lib/declaration-cache';
 import { scanHasAlpha } from './lib/metrics';
 
 // ---------------------------------------------------------------------------
@@ -80,12 +70,15 @@ interface QueuedFile {
 	file: File;
 	objectUrl: string;
 	// Content hash, computed once by the pre-flight pass (or by processing when
-	// the pre-flight was skipped) and reused for detection caching and the
-	// identical-output check.
+	// the pre-flight was skipped) and reused for the identical-output check.
+	// Left unset for inputs too large to hash eagerly, since the pre-flight
+	// does not need a digest and hashing one would read the whole file.
 	inputHash?: string;
-	// Pre-flight SynthID verdict for static images, so the UI can prompt the
-	// user to enable the removal option before they process the file.
-	synthidDetected?: SynthidDetection;
+	// Pre-flight SynthID declaration for the file, read from its own metadata,
+	// so the UI can offer the distortion option before the user processes it.
+	// This is Google's declaration rather than a carrier measurement, so it is
+	// named as such wherever it is shown.
+	synthidDeclared?: boolean;
 }
 
 interface ProcessedFile {
@@ -101,7 +94,6 @@ interface ProcessedFile {
 	success: boolean;
 	error?: string;
 	warnings?: string[];
-	synthidCheck?: SynthidCheckResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +112,7 @@ const GRID_COLUMNS = 4;
 const PAGE_ROWS = 4;
 const PAGE_SIZE = GRID_COLUMNS * PAGE_ROWS;
 // Upper bound on waiting for video metadata before giving up on dimension
-// lookups that feed the SynthID filter builder.
+// lookups that feed the distortion filter builder.
 const VIDEO_METADATA_TIMEOUT_MS = 5000;
 
 // ---------------------------------------------------------------------------
@@ -130,6 +122,12 @@ const VIDEO_METADATA_TIMEOUT_MS = 5000;
 const dropZone = document.getElementById('drop-zone') as HTMLElement;
 const fileInput = document.getElementById('file-input') as HTMLInputElement;
 const fileListSection = document.getElementById('file-list-section') as HTMLElement;
+// Every control in the options panel, so a batch can lock the whole set at once
+// rather than each control deciding for itself. A disabled fieldset makes its
+// descendants inert without overwriting the per-control disabled states the
+// option logic maintains (blur radius, JPEG quality, forced output formats),
+// which a blanket enable/disable pass would clobber.
+const optionsLock = document.getElementById('options-lock') as HTMLFieldSetElement;
 const fileList = document.getElementById('file-list') as HTMLElement;
 const fileCount = document.getElementById('file-count') as HTMLElement;
 const clearLsbInput = document.getElementById('clear-lsb') as HTMLInputElement;
@@ -158,31 +156,29 @@ const progressFill = document.getElementById('progress-fill') as HTMLElement;
 const progressText = document.getElementById('progress-text') as HTMLElement;
 const resultsSection = document.getElementById('results-section') as HTMLElement;
 const resultsList = document.getElementById('results-list') as HTMLElement;
-const synthidAttackInput = document.getElementById('synthid-attack') as HTMLInputElement;
-const synthidAdvancedToggle = document.getElementById('synthid-advanced-toggle') as HTMLButtonElement;
-const synthidSettingsGroup = document.getElementById('synthid-settings') as HTMLElement;
-const synthidPresetGroup = document.getElementById('synthid-preset-group') as HTMLElement;
-const synthidScopeGroup = document.getElementById('synthid-scope-group') as HTMLElement;
-const synthidScopeWrap = document.getElementById('synthid-scope-wrap') as HTMLElement;
-const synthidElasticInput = document.getElementById('synthid-elastic') as HTMLInputElement;
-const synthidElasticValue = document.getElementById('synthid-elastic-value') as HTMLElement;
-const synthidSigmaInput = document.getElementById('synthid-sigma') as HTMLInputElement;
-const synthidSigmaValue = document.getElementById('synthid-sigma-value') as HTMLElement;
-const synthidRotationInput = document.getElementById('synthid-rotation') as HTMLInputElement;
-const synthidRotationValue = document.getElementById('synthid-rotation-value') as HTMLElement;
-const synthidSqueezeInput = document.getElementById('synthid-squeeze') as HTMLInputElement;
-const synthidSqueezeValue = document.getElementById('synthid-squeeze-value') as HTMLElement;
-const synthidColorInput = document.getElementById('synthid-color') as HTMLInputElement;
-const synthidColorValue = document.getElementById('synthid-color-value') as HTMLElement;
-const synthidNoiseInput = document.getElementById('synthid-noise') as HTMLInputElement;
-const synthidNoiseValue = document.getElementById('synthid-noise-value') as HTMLElement;
-const synthidRoundsInput = document.getElementById('synthid-rounds') as HTMLInputElement;
-const synthidRoundsValue = document.getElementById('synthid-rounds-value') as HTMLElement;
-const synthidQualityInput = document.getElementById('synthid-quality') as HTMLInputElement;
-const synthidQualityValue = document.getElementById('synthid-quality-value') as HTMLElement;
-const synthidPsnrFloorInput = document.getElementById('synthid-psnr-floor') as HTMLInputElement;
-const synthidPsnrFloorValue = document.getElementById('synthid-psnr-floor-value') as HTMLElement;
-const synthidBilateralInput = document.getElementById('synthid-bilateral') as HTMLInputElement;
+const distortAttackInput = document.getElementById('distort-attack') as HTMLInputElement;
+const distortAdvancedToggle = document.getElementById('distort-advanced-toggle') as HTMLButtonElement;
+const distortSettingsGroup = document.getElementById('distort-settings') as HTMLElement;
+const distortPresetGroup = document.getElementById('distort-preset-group') as HTMLElement;
+const distortElasticInput = document.getElementById('distort-elastic') as HTMLInputElement;
+const distortElasticValue = document.getElementById('distort-elastic-value') as HTMLElement;
+const distortSigmaInput = document.getElementById('distort-sigma') as HTMLInputElement;
+const distortSigmaValue = document.getElementById('distort-sigma-value') as HTMLElement;
+const distortRotationInput = document.getElementById('distort-rotation') as HTMLInputElement;
+const distortRotationValue = document.getElementById('distort-rotation-value') as HTMLElement;
+const distortSqueezeInput = document.getElementById('distort-squeeze') as HTMLInputElement;
+const distortSqueezeValue = document.getElementById('distort-squeeze-value') as HTMLElement;
+const distortColorInput = document.getElementById('distort-color') as HTMLInputElement;
+const distortColorValue = document.getElementById('distort-color-value') as HTMLElement;
+const distortNoiseInput = document.getElementById('distort-noise') as HTMLInputElement;
+const distortNoiseValue = document.getElementById('distort-noise-value') as HTMLElement;
+const distortRoundsInput = document.getElementById('distort-rounds') as HTMLInputElement;
+const distortRoundsValue = document.getElementById('distort-rounds-value') as HTMLElement;
+const distortQualityInput = document.getElementById('distort-quality') as HTMLInputElement;
+const distortQualityValue = document.getElementById('distort-quality-value') as HTMLElement;
+const distortPsnrFloorInput = document.getElementById('distort-psnr-floor') as HTMLInputElement;
+const distortPsnrFloorValue = document.getElementById('distort-psnr-floor-value') as HTMLElement;
+const distortBilateralInput = document.getElementById('distort-bilateral') as HTMLInputElement;
 
 // ---------------------------------------------------------------------------
 // State
@@ -192,7 +188,7 @@ let queuedFiles: QueuedFile[] = [];
 let processedFiles: ProcessedFile[] = [];
 let fileListPage = 0;
 let resultsPage = 0;
-let synthidAdvancedExpanded = false;
+let distortAdvancedExpanded = false;
 // Guards against queue mutation and re-entrant runs while batch processing is
 // active, and against concurrent ZIP generations.
 let isProcessing = false;
@@ -324,7 +320,6 @@ async function processVideo(
 	file: File,
 	options: ProcessingOptions,
 	onStatus?: (phase: string, percent: number) => void,
-	inputCheck: SynthidDetection | null = null,
 	warnings: string[] = []
 ): Promise<ProcessingOutput> {
 	const ffmpeg = await getFFmpeg((pct) => onStatus?.('download', pct));
@@ -370,30 +365,19 @@ async function processVideo(
 			warnings.push(`Skipped for this video output (still images only): ${skippedImageOptions.join(', ')}.`);
 		}
 		await ffmpeg.writeFile(inputName, inputData);
-		let synthidFilters: string[] = [];
-		// Real videos get the scope-only rule because the detector cannot read
-		// them: under "detected images, no videos" a video can never be
-		// confirmed as watermarked, so removal is skipped silently and the
-		// other options still run. Both "detected images, all videos" and "all
-		// inputs" run the FFmpeg approximations on every video. Still images
-		// routed through FFmpeg (a GIF converted to MP4) remain covered by
-		// the detector and use the same verdict gate as the GIF path, so the
-		// chosen output container cannot change whether removal runs.
-		const videoSynthid = gateVideoSynthid(
-			inputMime.startsWith('video/'),
-			options.synthid,
-			options.synthidScope,
-			inputCheck,
-			warnings
-		);
-		if (videoSynthid.enabled) {
+		let distortFilters: string[] = [];
+		// The FFmpeg approximations run on every input the distortion option is
+		// enabled for. Nothing here measures the result, so there is no gate to
+		// consult and nothing to report afterwards.
+		const videoDistort = options.distort;
+		if (videoDistort.enabled) {
 			const frameSize = await getVideoFrameSize(file);
-			if (frameSize === null && videoSynthid.elasticAlpha >= 1) {
+			if (frameSize === null && videoDistort.elasticAlpha >= 1) {
 				warnings.push('The warp approximation was skipped because the video frame size could not be determined.');
 			}
-			synthidFilters = buildSynthidVideoFilters(videoSynthid, frameSize, Math.random, warnings);
-			if (isSubLevelVideoNoise(videoSynthid.lumaNoise)) {
-				warnings.push(subLevelVideoNoiseWarning(Number(synthidNoiseInput.step)));
+			distortFilters = buildDistortVideoFilters(videoDistort, frameSize, Math.random, warnings);
+			if (isSubLevelVideoNoise(videoDistort.lumaNoise)) {
+				warnings.push(subLevelVideoNoiseWarning(videoDistort.lumaNoiseStep));
 			}
 		}
 
@@ -419,22 +403,22 @@ async function processVideo(
 			return args;
 		};
 
-		let exitCode = await ffmpeg.exec(buildArgs(synthidFilters), 300000);
-		if (exitCode !== 0 && synthidFilters.length > 0) {
-			// The SynthID filter chain can fail on unusual inputs; retry with
+		let exitCode = await ffmpeg.exec(buildArgs(distortFilters), 300000);
+		if (exitCode !== 0 && distortFilters.length > 0) {
+			// The distortion filter chain can fail on unusual inputs; retry with
 			// metadata stripping only instead of failing the whole file.
-			logLines.push('--- retrying without SynthID filters ---');
+			logLines.push('--- retrying without distortion filters ---');
 			exitCode = await ffmpeg.exec(buildArgs([]), 300000);
 			// A retry that fails as well throws below, so only a retry with
 			// output may claim metadata stripping was applied.
 			if (exitCode === 0) {
-				warnings.push('The video SynthID filter chain failed for this file. Metadata stripping was applied without the SynthID stages.');
+				warnings.push('The video distortion filter chain failed for this file. Metadata stripping was applied without the distortion stages.');
 			}
-		} else if (synthidFilters.length > 0) {
+		} else if (distortFilters.length > 0) {
 			// Only describe the approximations when the chain actually ran, so
 			// a chain that failed into the metadata-only fallback does not
-			// also carry a note implying the SynthID stages were applied.
-			warnings.push('This video uses a simplified SynthID filter chain. The re-encode rounds, re-encode quality, quality floor, and smoothing settings were skipped because they apply to still images only.');
+			// also carry a note implying the distortion stages were applied.
+			warnings.push('This video uses a simplified distortion filter chain. The re-encode rounds, re-encode quality, quality floor, and smoothing settings were skipped because they apply to still images only.');
 		}
 		if (exitCode !== 0) {
 			const tail = logLines.slice(-20).join('\n');
@@ -452,13 +436,6 @@ async function processVideo(
 		return {
 			blob: new Blob([bytes], { type: profile.mime }),
 			warnings,
-			// A still image routed through FFmpeg stays covered by the detector,
-			// so report its input verdict when the attack ran or the input
-			// looked watermarked; a real video has none to offer and the MP4
-			// output cannot be verified.
-			synthidCheck: inputCheck !== null && (videoSynthid.enabled || inputCheck.isWatermarked)
-				? { input: inputCheck, output: null }
-				: undefined,
 		};
 	} catch (err) {
 		// Terminate the instance on failure so the next video gets a fresh load.
@@ -472,169 +449,13 @@ async function processVideo(
 	}
 }
 
-// Capped draw dimensions for a source: the longest side is bounded at
-// MAX_DETECT_DIMENSION. `scaled` is false when the source is already within the
-// cap and needs no resample. Single source of truth for the cap policy.
-function capDimensions(width: number, height: number): { cw: number; ch: number; scaled: boolean } {
-	const scale = Math.min(1, MAX_DETECT_DIMENSION / Math.max(width, height));
-	return {
-		cw: Math.max(1, Math.round(width * scale)),
-		ch: Math.max(1, Math.round(height * scale)),
-		scaled: scale < 1,
-	};
-}
-
-// Renders a source into a canvas capped at MAX_DETECT_DIMENSION on its
-// longest side, so SynthID detection never allocates a buffer proportional to
-// an unbounded input resolution. `scaled` reports whether the cap actually
-// resampled, so detection can report an honest exactMatch.
-function drawCappedBitmap(source: CanvasImageSource, width: number, height: number): { bitmap: Bitmap; scaled: boolean } {
-	const { cw, ch, scaled } = capDimensions(width, height);
-	const canvas = document.createElement('canvas');
-	canvas.width = cw;
-	canvas.height = ch;
-	const ctx = canvas.getContext('2d', { willReadFrequently: true });
-	if (!ctx) throw new Error('Could not create canvas context for detection');
-	ctx.drawImage(source, 0, 0, cw, ch);
-	return { bitmap: { width: cw, height: ch, data: ctx.getImageData(0, 0, cw, ch).data }, scaled };
-}
-
-// Re-renders an existing pixel buffer through the same bounded-resolution
-// draw, so detection on raw buffers (e.g. a decoded GIF frame) never feeds the
-// resampler an unbounded source. Buffers already within the cap are returned
-// unchanged, skipping a pointless resample. Downscaling runs on the raw buffer
-// directly instead of a full-size canvas round-trip, so peak memory stays near
-// one frame plus the capped output.
-function capBitmap(bitmap: Bitmap): { bitmap: Bitmap; scaled: boolean } {
-	const { cw, ch, scaled } = capDimensions(bitmap.width, bitmap.height);
-	if (!scaled) {
-		return { bitmap, scaled: false };
-	}
-	const data = resampleSeparable(bitmap.data, bitmap.width, bitmap.height, cw, ch, boxFilter);
-	return { bitmap: { width: cw, height: ch, data }, scaled: true };
-}
-
-// Whether the blob holds GIF data. Checks the magic header in addition to
-// the MIME type so files with an empty type (extension-allowlisted .gif)
-// still take the GIF reader path on both preflight and verification.
-async function isGifBlob(blob: Blob): Promise<boolean> {
-	if (blob.type === GIF_MIME) return true;
-	try {
-		if (blob.size < 6) return false;
-		const header = new Uint8Array(await blob.slice(0, 6).arrayBuffer());
-		return header[0] === 0x47 && header[1] === 0x49 && header[2] === 0x46
-			&& header[3] === 0x38 && (header[4] === 0x37 || header[4] === 0x39) && header[5] === 0x61;
-	} catch {
-		return false;
-	}
-}
-
-// Shared cache for the pipeline's detection passes. Keys are the hashes the
-// pipeline computes anyway for its identical-output check, so the pre-flight
-// badge, the processing-time input verdict, each retry probe, and the final
-// output verification never detect the same bytes twice.
-const synthidVerdicts = createDetectionCache(detectBlobSynthid);
-
-function detectSynthidCached(blob: Blob, contentHash: string): Promise<SynthidDetection> {
-	// The fallback fingerprint is not a cryptographic digest, so a collision
-	// could return another file's verdict; skip the shared cache rather than
-	// risk that.
-	if (isFallbackHash(contentHash)) return detectBlobSynthid(blob);
-	// Detection classifies GIFs by MIME before inspecting the magic bytes, so
-	// identical bytes can take different decode branches under different
-	// types; namespace the key so a verdict never crosses classifications.
-	const key = blob.type === GIF_MIME ? `${GIF_MIME}:${contentHash}` : `bytes:${contentHash}`;
-	return synthidVerdicts.get(blob, key);
-}
-
-// Decodes an encoded image blob and runs the SynthID carrier check on its
-// pixels, so the verdict reflects exactly what will be downloaded. Animated
-// GIFs check the first, middle, and last composed frames and report a
-// watermark when any of them conclusively flags, since later frames can carry
-// content the first frame does not. Without a conclusive flag the first
-// sampled frame's verdict is reported, because an inconclusive score is noise
-// either way and must not decide the verdict on its own. Google's C2PA
-// SynthID action, when present, is a prior that lets the detector read a
-// marginal carrier score it would
-// otherwise dismiss as clean content; processed outputs carry no metadata, so
-// their verification stays on the strict pixel test.
-async function detectBlobSynthid(blob: Blob): Promise<SynthidDetection> {
-	const sensitive = await hasSynthidManifest(blob);
-	if (await isGifBlob(blob)) {
-		const bytes = new Uint8Array(await blob.arrayBuffer());
-		const reader = new GifReader(bytes);
-		const frameCount = reader.numFrames();
-		validateGifAllocation(reader.width, reader.height, frameCount);
-		const indices = selectGifCheckIndices(frameCount);
-		if (indices.length === 0) {
-			throw new Error('GIF has no frames to process. The file may be a header-only stub.');
-		}
-		const wanted = new Set(indices);
-		const gifBackground = getGifBackground(bytes, reader.width, reader.height);
-		let canvas: Uint8ClampedArray = new Uint8ClampedArray(gifBackground.pixels);
-		const background = new Uint8ClampedArray(gifBackground.pixels);
-		let first: SynthidDetection | null = null;
-		for (let i = 0; i < frameCount; i += 1) {
-			const info = reader.frameInfo(i);
-			const beforeState = info.disposal === 3 ? new Uint8ClampedArray(canvas) : null;
-			reader.decodeAndBlitFrameRGBA(i, canvas);
-			if (wanted.has(i)) {
-				const { bitmap, scaled } = capBitmap({ width: reader.width, height: reader.height, data: canvas });
-				const detection = await detectSynthid(bitmap, { preResampled: scaled, sensitive });
-				if (!first) first = detection;
-				// Only a trusted verdict can short-circuit the frame scan; an
-				// inconclusive frame would return on noise.
-				if (detection.isWatermarked && detection.conclusive) return detection;
-			}
-			canvas = applyGifFrameDisposal(info, canvas, reader.width, reader.height, background, beforeState);
-		}
-		if (!first) {
-			throw new Error('GIF has no frames to process. The file may be a header-only stub.');
-		}
-		return first;
-	}
-	const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' });
-	try {
-		const { bitmap: capped, scaled } = drawCappedBitmap(bitmap, bitmap.width, bitmap.height);
-		return await detectSynthid(capped, { preResampled: scaled, sensitive });
-	} finally {
-		bitmap.close();
-	}
-}
-
-// Applies the LSB post-pass to the canvas itself so the retry probe and the
-// delivered bytes are the same pixels, including the randomize draw. Each
-// attempt redraws from the pristine source, so draws stay independent.
+// Applies the LSB post-pass to the canvas itself, so the encoded bytes and the
+// pixels the encode reads are the same buffer, including the randomize draw.
 function applyCanvasLsbPass(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, options: ProcessingOptions): void {
 	if (!options.clearLsb && !options.randomizeLsb) return;
 	const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 	applyLsbEffect(imageData, options);
 	ctx.putImageData(imageData, 0, 0);
-}
-
-// Runs the output-side SynthID check against the encoded blob and pairs it
-// with the input verdict, shared by the static and GIF paths. The "still
-// detectable" warning only fires when the attack actually ran (synthid.enabled)
-// and both ends conclusively read as watermarked; an inconclusive verdict is
-// noise and must not speak for either end.
-async function verifyOutputSynthid(
-	blob: Blob,
-	synthid: SynthidOptions,
-	inputCheck: SynthidDetection | null,
-	warnings: string[],
-	outputHash: string
-): Promise<SynthidCheckResult | undefined> {
-	if (!inputCheck) return undefined;
-	try {
-		const outputCheck = await detectSynthidCached(blob, outputHash);
-		if (synthid.enabled && inputCheck.conclusive && inputCheck.isWatermarked && outputCheck.conclusive && outputCheck.isWatermarked) {
-			warnings.push('SynthID may still be detectable in the output. Try a stronger preset or raise the attack strengths.');
-		}
-		return { input: inputCheck, output: outputCheck };
-	} catch {
-		warnings.push('SynthID output verification failed, so the output verdict is unavailable.');
-		return { input: inputCheck, output: null };
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -644,11 +465,10 @@ async function verifyOutputSynthid(
 async function processStaticImage(
 	file: File,
 	options: ProcessingOptions,
-	inputHash: string,
 	warnings: string[] = []
 ): Promise<ProcessingOutput> {
 	const img = await loadImageFromFile(file);
-	let synthid = options.synthid;
+	let distort = options.distort;
 	try {
 		const canvas = document.createElement('canvas');
 		canvas.width = img.naturalWidth;
@@ -658,144 +478,36 @@ async function processStaticImage(
 
 		ctx.drawImage(img, 0, 0);
 
-		// Input verdict comes from the shared blob probe, before any processing
-		// touches the canvas. Sharing the cached detector with the pre-flight
-		// badge, the retry probe, and the output verification keeps every
-		// verdict on one decoder instead of mixing Image-element and
-		// ImageBitmap decodes, whose EXIF and color handling can disagree.
-		let inputCheck: SynthidDetection | null = null;
-		try {
-			inputCheck = await detectSynthidCached(file, inputHash);
-		} catch {
-			// Reported as a missing check below rather than failing the file.
-		}
-
 		if (options.applyBlur && options.blurRadius > 0) {
 			const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 			applyBlurEffect(imageData, options);
 			ctx.putImageData(imageData, 0, 0);
 		}
 
-		// When scoped to detected images, skip the attack on clean inputs so
-		// heavy distortion isn't wasted on files that carry no watermark. This
-		// runs before the pixel-limit guard so a clean oversized image is not
-		// mistaken for one that exceeded the limit. The other steganography
-		// options still apply below; only SynthID removal is gated.
-		synthid = gateSynthidByDetection(synthid, options.synthidScope, inputCheck, warnings);
-
-		// Oversized images skip SynthID processing entirely rather than
-		// failing; the standard steganography options still run.
-		if (synthid.enabled && img.naturalWidth * img.naturalHeight > MAX_SYNTHID_IMAGE_PIXELS) {
-			warnings.push(`SynthID removal was skipped because the image exceeds the ${MAX_SYNTHID_IMAGE_PIXELS.toLocaleString()} pixel limit; other options were applied.`);
-			synthid = { ...synthid, enabled: false };
+		// Oversized images skip the distortion entirely rather than failing; the
+		// standard steganography options still run.
+		if (distort.enabled && img.naturalWidth * img.naturalHeight > MAX_DISTORT_PIXELS) {
+			warnings.push(`Media distortion was skipped because the image exceeds the ${MAX_DISTORT_PIXELS.toLocaleString()} pixel limit; other options were applied.`);
+			distort = { ...distort, enabled: false };
 		}
 
 		const inputMime = detectInputMime(file);
 		const outputMime = getOutputMime(inputMime, options);
 		const quality = outputMime === 'image/jpeg' ? options.jpegQuality / 100 : undefined;
 
-		if (synthid.enabled) {
-			// The attack is a per-file draw: tile shifts, rotation and noise
-			// come from fresh randomness, so an individual run can leave a
-			// marginal watermark above the detection boundary. When the encoded
-			// result still reads as watermarked, redraw the pristine source and
-			// draw again instead of reporting the unlucky draw, so re-running
-			// "process all" is not the user's only remedy.
-			const totalAttempts = 1 + SYNTHID_RETRY_ATTEMPTS;
-			// The best draw measured so far, plus the verdict of the draw whose
-			// pixels are currently on the canvas (cleared when a redraw replaces
-			// them), so the deliverable attempt can be chosen after the loop.
-			let bestDraw: { image: ImageData; warnings: string[]; confidence: number } | null = null;
-			let drawnCheck: SynthidDetection | null = null;
-			for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
-				// Warnings describe the delivered bytes, so a discarded attempt
-				// must not leave its skip warnings behind for the next attempt
-				// to inherit. The checkpoint restores the pre-attempt state when
-				// the retry rule fires below.
-				const warningsCheckpoint = warnings.length;
-				if (attempt > 0) {
-					// Start from the pre-pipeline state rather than the previous
-					// attempt's output, so retries are independent draws and the
-					// quality cost never compounds. The clear is required because
-					// drawImage composites: without it, transparent and
-					// semi-transparent source pixels would retain the previous
-					// attempt's distortion.
-					ctx.clearRect(0, 0, canvas.width, canvas.height);
-					ctx.drawImage(img, 0, 0);
-					drawnCheck = null;
-					if (options.applyBlur && options.blurRadius > 0) {
-						const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-						applyBlurEffect(imageData, options);
-						ctx.putImageData(imageData, 0, 0);
-					}
-				}
-				await applySynthidPipeline(canvas, synthid, warnings);
-				// The LSB pass runs on the canvas before probing, so the probe
-				// encodes exactly the bytes the download will use, including
-				// the randomize draw.
-				applyCanvasLsbPass(ctx, canvas, options);
-				// Retrying is only meaningful when the detector can actually
-				// read the watermark; an inconclusive size would redraw on noise.
-				if (!inputCheck?.isWatermarked || !inputCheck.conclusive) break;
-				try {
-					// Probe with the same encoder the download will use, so a
-					// retry only happens when the bytes the user would get
-					// still read as watermarked.
-					const probe = await canvasToBlob(canvas, outputMime, quality);
-					if (probe.type !== outputMime) break;
-					// Hashing the probe lets the final verification below reuse
-					// this verdict because the final encode re-encodes the same
-					// canvas pixels.
-					const probeHash = await computeSha256(probe);
-					const check = await detectSynthidCached(probe, probeHash);
-					// Keep the strongest evidence of removal across draws: the
-					// lowest confidence wins, and its pixels and warnings are
-					// snapshotted together so the delivered bytes always match
-					// the verdict they were measured with.
-					drawnCheck = check;
-					if (!bestDraw || check.confidence < bestDraw.confidence) {
-						bestDraw = {
-							image: ctx.getImageData(0, 0, canvas.width, canvas.height),
-							warnings: [...warnings],
-							confidence: check.confidence,
-						};
-					}
-					// Only a trusted output flag justifies a redraw; an
-					// inconclusive output size would redraw on noise.
-					if (!shouldRetrySynthidAttempt(inputCheck.isWatermarked, check.conclusive && check.isWatermarked, attempt, totalAttempts)) break;
-					// The next attempt redraws from the pristine source with a
-					// fresh random draw, so this attempt's verdicts are replaced.
-					warnings.length = warningsCheckpoint;
-				} catch {
-					// The probe is additive; the final verification below still
-					// reports the downloaded bytes honestly.
-					break;
-				}
-			}
-			// The loop stops on the first draw that reads clean, with that draw
-			// on the canvas. When the canvas holds a flagged draw, or a draw
-			// whose probe failed before measuring it, put the least watermarked
-			// measured draw back instead of the last: draws differ in luck as
-			// much as strength, so ending on an unlucky roll or on an unmeasured
-			// one would report a worse verdict than an earlier draw earned.
-			if (bestDraw && shouldRestoreBestDraw(bestDraw, drawnCheck)) {
-				ctx.putImageData(bestDraw.image, 0, 0);
-				warnings.length = 0;
-				warnings.push(...bestDraw.warnings);
-			}
-		} else {
-			// Without the SynthID pipeline the LSB pass still runs once here;
-			// with it, each attempt above already applied it.
-			applyCanvasLsbPass(ctx, canvas, options);
-		}
+		if (distort.enabled) await applyDistortPipeline(canvas, distort, warnings);
+		// The LSB pass always runs last, so the bytes that get encoded are the
+		// distorted ones and the randomize draw is never overwritten by a stage
+		// that ran after it.
+		applyCanvasLsbPass(ctx, canvas, options);
 
 		// Snapshot the canvas immediately before serialization. Like every
 		// other gate under marginal semantics, the final encode is measured
 		// against its own input rather than against some earlier stage's
 		// result, so it cannot be blamed for cumulative drift and the user's
 		// chosen quality is respected within a small bounded margin. It is
-		// built only when the SynthID pipeline is active, so its nullness
-		// tracks synthid.enabled exactly as encodeStaticImage expects. On the
+		// built only when the distortion pipeline is active, so its nullness
+		// tracks distort.enabled exactly as encodeStaticImage expects. On the
 		// JPEG path the same fresh buffer also drives the transparency
 		// warning, avoiding a second full-canvas read. The alias stays valid
 		// only because encodeStaticImage re-encodes without mutating the
@@ -804,29 +516,20 @@ async function processStaticImage(
 		if (outputMime === 'image/jpeg') {
 			const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
 			// Canvas JPEG encoding flattens transparency onto black, so warn
-			// regardless of whether SynthID removal is enabled.
+			// regardless of whether the distortion is enabled.
 			if (scanHasAlpha(data)) {
 				warnings.push('JPEG output discards transparency from the input image.');
 			}
-			if (synthid.enabled) preEncode = data;
-		} else if (synthid.enabled) {
+			if (distort.enabled) preEncode = data;
+		} else if (distort.enabled) {
 			preEncode = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
 		}
-		const blob = await encodeStaticImage(canvas, outputMime, quality, synthid, preEncode, warnings);
+		const blob = await encodeStaticImage(canvas, outputMime, quality, distort, preEncode, warnings);
 		// The caller needs this hash for the identical-output check, so compute
-		// it once here and share it with the output-side SynthID cache.
+		// it once here rather than hashing again.
 		const outputHash = await computeSha256(blob);
 
-		// Report the detector verdict only when the SynthID attack actually ran
-		// or the input looked watermarked. A clean input under a detected scope
-		// skips removal entirely, so a verdict line there would claim a check
-		// the user scoped out; a flagged input still reports even when a gate
-		// skipped the attack, so the skip stays visible next to the verdict
-		// that triggered it.
-		const shouldVerify = inputCheck !== null && (synthid.enabled || inputCheck.isWatermarked);
-		const synthidCheck = shouldVerify ? await verifyOutputSynthid(blob, synthid, inputCheck, warnings, outputHash) : undefined;
-
-		return { blob, warnings, synthidCheck, outputHash };
+		return { blob, warnings, outputHash };
 	} finally {
 		URL.revokeObjectURL(img.src);
 	}
@@ -853,7 +556,6 @@ function validateGifAllocation(width: number, height: number, frameCount: number
 async function processAnimatedGif(
 	file: File,
 	options: ProcessingOptions,
-	inputHash: string,
 	warnings: string[] = []
 ): Promise<ProcessingOutput> {
 	const buffer = new Uint8Array(await readFileAsArrayBuffer(file));
@@ -862,37 +564,19 @@ async function processAnimatedGif(
 	const height = reader.height;
 	const frameCount = reader.numFrames();
 	const estimatedSize = validateGifAllocation(width, height, frameCount);
-	// When scoped to detected images, skip the heavy per-frame attack on clean
-	// GIFs. This runs before the pixel-limit guard so a clean oversized GIF is
-	// not mistaken for one that exceeded the limit. The other steganography
-	// options still apply per frame below; only SynthID removal is gated.
-	let synthid = options.synthid;
-	// Input verdict from the sampled composed frames, shared with the
-	// pre-flight pass and repeat runs through the content-hash verdict cache,
-	// so the frame composition and detector only run once per GIF. A
-	// conclusive watermark in any sampled frame enables removal and is the
-	// reported verdict; otherwise the first sampled frame's verdict is
-	// reported.
-	let inputCheck: SynthidDetection | null = null;
-	try {
-		inputCheck = await detectSynthidCached(file, inputHash);
-	} catch {
-		// Detection is additive; a missing verdict degrades to no gating.
-		inputCheck = null;
-	}
-	synthid = gateSynthidByDetection(synthid, options.synthidScope, inputCheck, warnings);
+	let distort = options.distort;
 
-	// Oversized GIFs skip SynthID processing entirely rather than failing;
-	// the standard steganography options still run.
-	if (synthid.enabled && width * height * frameCount > MAX_SYNTHID_GIF_PIXELS) {
-		warnings.push(`SynthID removal was skipped because the GIF exceeds the ${MAX_SYNTHID_GIF_PIXELS.toLocaleString()} total frame pixel limit; other options were applied.`);
-		synthid = { ...synthid, enabled: false };
+	// Oversized GIFs skip the distortion entirely rather than failing; the
+	// standard steganography options still run.
+	if (distort.enabled && width * height * frameCount > MAX_GIF_PIXELS) {
+		warnings.push(`Media distortion was skipped because the GIF exceeds the ${MAX_GIF_PIXELS.toLocaleString()} total frame pixel limit; other options were applied.`);
+		distort = { ...distort, enabled: false };
 	}
 
 	const frames: { indices: Uint8Array; palette: number[]; delay: number; transparentIndex: number }[] = [];
 
 	// Generate the random attack parameters once so all frames warp consistently.
-	const synthidState = synthid.enabled ? buildSynthidRandomState(width, height, synthid) : null;
+	const distortState = distort.enabled ? buildDistortRandomState(width, height, distort) : null;
 	// Same per-file draw policy for the palette LSB pass: every frame rebuilds
 	// the generator from one seed, so identical palettes get identical low bits
 	// instead of flickering between frames.
@@ -901,24 +585,24 @@ async function processAnimatedGif(
 	// round. Median-cut is idempotent at a fixed depth, so additional rounds
 	// would not add loss; the configured round count therefore only switches
 	// this one round on or off.
-	const gifMaxColors = synthidState !== null && synthid.reencodeRounds > 0
-		? gifQualityToMaxColors(synthid.reencodeQuality)
+	const gifMaxColors = distortState !== null && distort.reencodeRounds > 0
+		? gifQualityToMaxColors(distort.reencodeQuality)
 		: GIF_DEFAULT_MAX_COLORS;
-	if (synthidState) {
-		const gifSpatialWork = synthidState.tileShift !== null
-			|| synthidState.affine !== null
-			|| synthidState.color !== null
-			|| (Number.isFinite(synthid.squeezeFactor) && synthid.squeezeFactor > 0 && synthid.squeezeFactor < 1)
-			|| synthid.lumaNoise > 0
-			|| synthid.bilateral;
+	if (distortState) {
+		const gifSpatialWork = distortState.tileShift !== null
+			|| distortState.affine !== null
+			|| distortState.color !== null
+			|| (Number.isFinite(distort.squeezeFactor) && distort.squeezeFactor > 0 && distort.squeezeFactor < 1)
+			|| distort.lumaNoise > 0
+			|| distort.bilateral;
 		const gifNotes: string[] = [];
 		if (gifSpatialWork) {
 			gifNotes.push('every frame is distorted unconditionally to avoid flicker, and the quality floor (PSNR) is not applied to animated frames');
 		}
-		if (synthid.reencodeRounds > 1) {
+		if (distort.reencodeRounds > 1) {
 			gifNotes.push('re-encode rounds are capped at one: the reduced-palette quantization is idempotent, so extra rounds would not add further loss');
 		}
-		if (synthid.reencodeRounds > 0 && gifMaxColors === GIF_DEFAULT_MAX_COLORS) {
+		if (distort.reencodeRounds > 0 && gifMaxColors === GIF_DEFAULT_MAX_COLORS) {
 			gifNotes.push('a re-encode quality of 100% keeps the full 256-color palette, so the re-encode round changes nothing unless the quality is lowered to actually reduce colors');
 		}
 		if (gifNotes.length > 0) {
@@ -942,7 +626,7 @@ async function processAnimatedGif(
 		// Decode frame on top of current canvas.
 		reader.decodeAndBlitFrameRGBA(i, canvas);
 
-		// Process the composed full canvas. SynthID distortion stages run
+		// Process the composed full canvas. The distortion stages run
 		// unconditionally on every frame: judging acceptance per frame would
 		// make the structural stages flip on and off between neighboring
 		// frames, which shows up as visible pulsing in the finished animation.
@@ -951,11 +635,11 @@ async function processAnimatedGif(
 		// depth and reuses its mapping.
 		const imageData = new ImageData(new Uint8ClampedArray(canvas), width, height);
 		applyBlurEffect(imageData, options);
-		if (synthidState) {
+		if (distortState) {
 			// The real warnings array is passed so a later switch to per-frame
 			// gating surfaces floor skips instead of silently dropping them.
-			await applySynthidDistortionStages(imageData, synthidState, synthid, false, warnings);
-			await applySynthidSmoothingStage(imageData, synthid, false, warnings);
+			await applyDistortStages(imageData, distortState, distort, false, warnings);
+			await applyDistortSmoothingStage(imageData, distort, false, warnings);
 		}
 
 		// Quantization is the final GIF serialization step. It runs
@@ -968,7 +652,7 @@ async function processAnimatedGif(
 		// serialization. The LSB pass runs on the palette below rather than on
 		// the frame pixels above, because quantization replaces every color
 		// and would otherwise overwrite the pass.
-		const quantized = synthidState && gifMaxColors < GIF_DEFAULT_MAX_COLORS
+		const quantized = distortState && gifMaxColors < GIF_DEFAULT_MAX_COLORS
 			? quantizeImageToPalette(imageData, gifMaxColors)
 			: null;
 		const { palette, indices, transparentIndex } = quantized
@@ -1023,12 +707,7 @@ async function processAnimatedGif(
 	// Shared with the caller so the identical-output check does not rehash.
 	const outputHash = await computeSha256(blob);
 
-	// Same verdict rule as the static path: report only when the attack ran or
-	// the input looked watermarked.
-	const shouldVerify = inputCheck !== null && (synthid.enabled || inputCheck.isWatermarked);
-	const synthidCheck = shouldVerify ? await verifyOutputSynthid(blob, synthid, inputCheck, warnings, outputHash) : undefined;
-
-	return { blob, warnings, synthidCheck, outputHash };
+	return { blob, warnings, outputHash };
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,38 +736,24 @@ async function processSingleFile(
 
 		let output: ProcessingOutput;
 		if (routesToVideo(inputMime, outputMime)) {
-			// A still image routed through FFmpeg (a GIF converted to MP4) is
-			// still covered by the detector, so fetch its cached verdict;
-			// real videos have no verdict to offer. The verdict feeds both the
-			// scope gate and the result reporting, so it is fetched whenever
-			// the detector can produce one instead of only when the gate
-			// consults it, matching the static image and GIF paths.
-			let inputCheck: SynthidDetection | null = null;
-			if (!inputMime.startsWith('video/')) {
-				try {
-					inputCheck = await detectSynthidCached(file, inputHash);
-				} catch {
-					// The scope gate reports the failed detection as a warning.
-				}
-			}
-			output = await processVideo(file, options, onVideoStatus, inputCheck, outputWarnings);
+			output = await processVideo(file, options, onVideoStatus, outputWarnings);
 		} else if (inputMime === 'image/gif') {
-			output = await processAnimatedGif(file, options, inputHash, outputWarnings);
+			output = await processAnimatedGif(file, options, outputWarnings);
 		} else {
-			output = await processStaticImage(file, options, inputHash, outputWarnings);
+			output = await processStaticImage(file, options, outputWarnings);
 		}
-		const { blob, warnings, synthidCheck, outputHash: processedOutputHash } = output;
+		const { blob, warnings, outputHash: processedOutputHash } = output;
 
-		// Image paths already hashed their output for the verdict cache; only
-		// video output reaches here without one.
+		// Image paths already hashed their output for the identical-output
+		// check; only video output reaches here without one.
 		const outputHash = processedOutputHash ?? (await computeSha256(blob));
 
 		if (inputHash === outputHash) {
 			// LSB/blur/JPEG are images-only; video inputs only get metadata
-			// stripping plus the SynthID approximations, so tailor the advice.
+			// stripping plus the distortion approximations, so tailor the advice.
 			const identicalError = routesToVideo(inputMime, outputMime)
-				? 'Output is identical to input. No steganography was removed. Enable SynthID removal.'
-				: 'Output is identical to input. No steganography was removed. Enable SynthID removal, LSB clearing, blur, or JPEG re-compression.';
+				? 'Output is identical to input. No steganography was removed. Enable media distortion.'
+				: 'Output is identical to input. No steganography was removed. Enable media distortion, LSB clearing, blur, or JPEG re-compression.';
 			return {
 				id,
 				originalName: file.name,
@@ -1101,7 +766,6 @@ async function processSingleFile(
 				objectUrl: '',
 				success: false,
 				warnings,
-				synthidCheck,
 				error: identicalError,
 			};
 		}
@@ -1118,12 +782,10 @@ async function processSingleFile(
 			objectUrl: URL.createObjectURL(blob),
 			success: true,
 			warnings,
-			synthidCheck,
 		};
 	} catch (err) {
-		// Surface warnings gathered before the failure (e.g. gate notes,
-		// GIF approximation notes, or FFmpeg fallback notes) alongside the
-		// error.
+		// Surface warnings gathered before the failure (e.g. GIF approximation
+		// notes or FFmpeg fallback notes) alongside the error.
 		return {
 			id,
 			originalName: file.name,
@@ -1199,38 +861,38 @@ function getOutputFormatsFromRows(): Record<string, string> {
 	return map;
 }
 
-function getSynthidPresetFromGroup(): SynthidPreset | null {
-	const value = getSelectedRadioValue(synthidPresetGroup);
+function getDistortPresetFromGroup(): DistortPreset | null {
+	const value = getSelectedRadioValue(distortPresetGroup);
 	if (value === 'gentle' || value === 'balanced' || value === 'aggressive') {
-		return SYNTHID_PRESETS[value];
+		return DISTORT_PRESETS[value];
 	}
 	return null;
 }
 
-function applySynthidPreset(preset: SynthidPreset): void {
-	synthidElasticInput.value = String(preset.elasticAlpha);
-	synthidSigmaInput.value = String(preset.elasticSigma);
-	synthidRotationInput.value = String(preset.rotationJitter);
-	synthidSqueezeInput.value = String(preset.squeezeFactor);
-	synthidColorInput.value = String(preset.colorAmount);
-	synthidNoiseInput.value = String(preset.lumaNoise);
-	synthidRoundsInput.value = String(preset.reencodeRounds);
-	synthidQualityInput.value = String(preset.reencodeQuality);
-	synthidPsnrFloorInput.value = String(preset.psnrFloor);
-	synthidBilateralInput.checked = preset.bilateral;
-	refreshSynthidDisplays();
+function applyDistortPreset(preset: DistortPreset): void {
+	distortElasticInput.value = String(preset.elasticAlpha);
+	distortSigmaInput.value = String(preset.elasticSigma);
+	distortRotationInput.value = String(preset.rotationJitter);
+	distortSqueezeInput.value = String(preset.squeezeFactor);
+	distortColorInput.value = String(preset.colorAmount);
+	distortNoiseInput.value = String(preset.lumaNoise);
+	distortRoundsInput.value = String(preset.reencodeRounds);
+	distortQualityInput.value = String(preset.reencodeQuality);
+	distortPsnrFloorInput.value = String(preset.psnrFloor);
+	distortBilateralInput.checked = preset.bilateral;
+	refreshDistortDisplays();
 }
 
-function refreshSynthidDisplays(): void {
-	synthidElasticValue.textContent = `${synthidElasticInput.value}px`;
-	synthidSigmaValue.textContent = `${synthidSigmaInput.value}px`;
-	synthidRotationValue.textContent = `${synthidRotationInput.value}°`;
-	synthidSqueezeValue.textContent = `${parseFloat(synthidSqueezeInput.value).toFixed(2)}×`;
-	synthidColorValue.textContent = `${parseFloat(synthidColorInput.value).toFixed(2)}×`;
-	synthidNoiseValue.textContent = synthidNoiseInput.value;
-	synthidRoundsValue.textContent = synthidRoundsInput.value;
-	synthidQualityValue.textContent = `${synthidQualityInput.value}%`;
-	synthidPsnrFloorValue.textContent = `${synthidPsnrFloorInput.value} dB`;
+function refreshDistortDisplays(): void {
+	distortElasticValue.textContent = `${distortElasticInput.value}px`;
+	distortSigmaValue.textContent = `${distortSigmaInput.value}px`;
+	distortRotationValue.textContent = `${distortRotationInput.value}°`;
+	distortSqueezeValue.textContent = `${parseFloat(distortSqueezeInput.value).toFixed(2)}×`;
+	distortColorValue.textContent = `${parseFloat(distortColorInput.value).toFixed(2)}×`;
+	distortNoiseValue.textContent = distortNoiseInput.value;
+	distortRoundsValue.textContent = distortRoundsInput.value;
+	distortQualityValue.textContent = `${distortQualityInput.value}%`;
+	distortPsnrFloorValue.textContent = `${distortPsnrFloorInput.value} dB`;
 }
 
 // Invalid squeeze factors are treated as disabled (1) rather than
@@ -1256,7 +918,7 @@ function getProcessingOptions(): ProcessingOptions {
 	const mode = getSelectedRadioValue(filenameModeGroup) as ProcessingOptions['filenameMode'];
 	// Tampered fields fall back to the displayed balanced preset (and the
 	// matching slider defaults) instead of silently disabling stages with 0.
-	const preset = SYNTHID_PRESETS.balanced;
+	const preset = DISTORT_PRESETS.balanced;
 	return {
 		clearLsb: clearLsbInput.checked,
 		randomizeLsb: randomizeLsbInput.checked,
@@ -1264,20 +926,20 @@ function getProcessingOptions(): ProcessingOptions {
 		blurRadius: clampToSlider(blurRadiusInput, parseNumber(blurRadiusInput.value, 1), 1),
 		jpegRecompress: jpegRecompressInput.checked,
 		jpegQuality: clampToSlider(jpegQualityInput, parseInteger(jpegQualityInput.value, 85), 85),
-		synthid: {
-			enabled: synthidAttackInput.checked,
-			elasticAlpha: clampToSlider(synthidElasticInput, parseNumber(synthidElasticInput.value, preset.elasticAlpha), preset.elasticAlpha),
-			elasticSigma: clampToSlider(synthidSigmaInput, parseNumber(synthidSigmaInput.value, preset.elasticSigma), preset.elasticSigma),
-			rotationJitter: clampToSlider(synthidRotationInput, parseNumber(synthidRotationInput.value, preset.rotationJitter), preset.rotationJitter),
-			squeezeFactor: clampSqueezeFactor(parseNumber(synthidSqueezeInput.value, 1)),
-			colorAmount: clampToSlider(synthidColorInput, parseNumber(synthidColorInput.value, preset.colorAmount), preset.colorAmount),
-			lumaNoise: clampToSlider(synthidNoiseInput, parseNumber(synthidNoiseInput.value, preset.lumaNoise), preset.lumaNoise),
-			reencodeRounds: clampToSlider(synthidRoundsInput, parseInteger(synthidRoundsInput.value, preset.reencodeRounds), preset.reencodeRounds),
-			reencodeQuality: clampToSlider(synthidQualityInput, parseInteger(synthidQualityInput.value, preset.reencodeQuality), preset.reencodeQuality),
-			bilateral: synthidBilateralInput.checked,
-			psnrFloor: clampToSlider(synthidPsnrFloorInput, parseInteger(synthidPsnrFloorInput.value, preset.psnrFloor), preset.psnrFloor),
+		distort: {
+			enabled: distortAttackInput.checked,
+			elasticAlpha: clampToSlider(distortElasticInput, parseNumber(distortElasticInput.value, preset.elasticAlpha), preset.elasticAlpha),
+			elasticSigma: clampToSlider(distortSigmaInput, parseNumber(distortSigmaInput.value, preset.elasticSigma), preset.elasticSigma),
+			rotationJitter: clampToSlider(distortRotationInput, parseNumber(distortRotationInput.value, preset.rotationJitter), preset.rotationJitter),
+			squeezeFactor: clampSqueezeFactor(parseNumber(distortSqueezeInput.value, 1)),
+			colorAmount: clampToSlider(distortColorInput, parseNumber(distortColorInput.value, preset.colorAmount), preset.colorAmount),
+			lumaNoise: clampToSlider(distortNoiseInput, parseNumber(distortNoiseInput.value, preset.lumaNoise), preset.lumaNoise),
+			lumaNoiseStep: Number(distortNoiseInput.step),
+			reencodeRounds: clampToSlider(distortRoundsInput, parseInteger(distortRoundsInput.value, preset.reencodeRounds), preset.reencodeRounds),
+			reencodeQuality: clampToSlider(distortQualityInput, parseInteger(distortQualityInput.value, preset.reencodeQuality), preset.reencodeQuality),
+			bilateral: distortBilateralInput.checked,
+			psnrFloor: clampToSlider(distortPsnrFloorInput, parseInteger(distortPsnrFloorInput.value, preset.psnrFloor), preset.psnrFloor),
 		},
-		synthidScope: (getSelectedRadioValue(synthidScopeGroup) || 'detected') as ProcessingOptions['synthidScope'],
 		outputFormats: getOutputFormatsFromRows(),
 		filenameMode: mode || 'suffix',
 		outputSuffix: outputSuffixInput.value.trim() || '-clean',
@@ -1425,11 +1087,10 @@ function updateFileList(): void {
 
 		info.append(name, meta);
 
-		// Only a trusted verdict earns the badge; an inconclusive clean match
-		// too small to carry the carriers would advertise a detection the
-		// detector cannot actually back up.
-		if (queued.synthidDetected?.isWatermarked && queued.synthidDetected.conclusive) {
-			info.append(createSynthidBadge(queued.synthidDetected));
+		// The badge reports the file's own SynthID declaration, so it appears
+		// exactly when that declaration is present in the metadata.
+		if (queued.synthidDeclared) {
+			info.append(createSynthidBadge());
 		}
 
 		const remove = document.createElement('button');
@@ -1478,13 +1139,12 @@ function addFilesToQueue(files: FileList | null): void {
 			objectUrl: URL.createObjectURL(file),
 		};
 		queuedFiles.push(queued);
-		if (!isVideoFile(file)) {
-			// Best-effort pre-check that runs in the background so the file
-			// list can appear immediately and then update with the verdict.
-			// Detections are serialized so a large batch doesn't run several
-			// multi-FFT passes at once and freeze the page.
-			enqueuePreflight(queued);
-		}
+		// Best-effort pre-check that runs in the background so the file list can
+		// appear immediately and then update with the declaration. Every container
+		// the app accepts can carry the C2PA action, videos included, so nothing is
+		// excluded here. Reads are serialized so a large batch never runs several
+		// scans at once and stalls the page.
+		enqueuePreflight(queued);
 	}
 	updateFileList();
 	if (skipped.length > 0) {
@@ -1494,19 +1154,29 @@ function addFilesToQueue(files: FileList | null): void {
 	}
 }
 
-// Serial queue for the background pre-flight SynthID checks. Delegates to the
-// same decoder used for output verification so the badge verdict and the
-// processing-time probe share one decoder per format: GIFs are blitted through
-// the GIF reader on both sides (magic-sniffed, not MIME-sniffed), while static
-// images both decode via createImageBitmap with pinned orientation.
+// Shared cache of metadata declarations, keyed by content digest. The pre-flight
+// populates it and any later pass reads through it, so the same bytes are never
+// examined twice. Each declaration kind gets its own reader here rather than at
+// the call site, so a second steganography type is added by naming its kind and
+// its reader and nothing else.
+const synthidMetadata = createDeclarationCache({
+	synthidMetadata: async (bytes) => hasSynthidDeclarationInBytes(bytes),
+});
+
+// Serial queue for the background pre-flight declaration scans. One scan runs
+// at a time so adding a large batch cannot start a read per file at once.
 let preflightQueue: Promise<void> = Promise.resolve();
-// Epoch bumped by clearAll so stale queued detections become cheap no-ops
-// instead of running multi-FFT passes behind new files.
+// Epoch bumped by clearAll so scans queued for files the user discarded become
+// cheap no-ops instead of running behind the new queue.
 let preflightEpoch = 0;
-// Gate that parks queued pre-flight checks while batch processing runs, so
-// their multi-FFT passes do not interleave with the pipeline's own detection
-// work on the main thread. The one detection already executing when the gate
-// closes is awaited by pausePreflights before processing begins.
+// Gate that parks queued pre-flight scans while batch processing runs, so their
+// reads do not interleave with the pipeline's own work on the main thread. The
+// one scan already executing when the gate closes is awaited by
+// pausePreflights before processing begins. A scan is a bounded byte read
+// today, so the gate costs little either way; it is kept because a slower
+// detector replacing it would need exactly this separation, and a badge that
+// appears only after the batch finishes is a fair trade for keeping the
+// pipeline's main thread to itself.
 let preflightGate: Promise<void> | null = null;
 let releasePreflightGate: (() => void) | null = null;
 let preflightInflight: Promise<void> | null = null;
@@ -1530,49 +1200,112 @@ function resumePreflights(): void {
 
 function enqueuePreflight(queued: QueuedFile): void {
 	const epoch = preflightEpoch;
-	preflightQueue = preflightQueue.then(async () => {
-		if (epoch !== preflightEpoch) return;
-		if (preflightGate) await preflightGate;
-		if (epoch !== preflightEpoch) return;
-		const run = async () => {
+	preflightQueue = preflightQueue
+		.then(async () => {
+			if (epoch !== preflightEpoch) return;
+			if (preflightGate) await preflightGate;
+			const run = async () => {
+				try {
+					// Re-checked rather than trusted from the gate check above,
+					// because every await in this chain is a point where the queue
+					// can change. The epoch catches a cleared queue, the membership
+					// check catches one file removed from a queue that was not, and
+					// a scan that waited out the gate needs both.
+					if (epoch !== preflightEpoch) return;
+					if (!queuedFiles.includes(queued)) return;
+					// A bounded edge scan for Google's declaration, which answers
+					// the only question the badge asks and needs no image decode.
+					// A small input is read once for both its content key and
+					// the search; a large one never has its payload read just to
+					// look at its metadata.
+					const declared = await readSynthidMetadata(queued);
+					if (epoch !== preflightEpoch) return;
+					if (!queuedFiles.includes(queued)) return;
+					queued.synthidDeclared = declared;
+					// The badge is informational only. It reports what the file's own
+					// metadata claims, which is not evidence the pixels carry a
+					// watermark this tool can affect, so finding one must not change
+					// the user's options for them. Clicking the badge is how they ask
+					// for the distortion.
+					updateQueuedBadge(queued);
+				} catch {}
+			};
+			// The assignment must stay synchronously adjacent to the gate check
+			// above: an await in between would let pausePreflights miss this run
+			// and start the batch while the read is still going.
+			preflightInflight = run();
 			try {
-				// Check before hashing so a file removed while its pre-flight
-				// waited in the serial queue is not read and hashed for nothing;
-				// re-check after the hash await because the queue can change.
-				if (epoch !== preflightEpoch) return;
-				if (!queuedFiles.includes(queued)) return;
-				const inputHash = queued.inputHash ?? (await computeSha256(queued.file));
-				queued.inputHash = inputHash;
-				if (epoch !== preflightEpoch) return;
-				if (!queuedFiles.includes(queued)) return;
-				const detection = await detectSynthidCached(queued.file, inputHash);
-				if (epoch !== preflightEpoch) return;
-				if (!queuedFiles.includes(queued)) return;
-				queued.synthidDetected = detection;
-				updateQueuedBadge(queued);
-			} catch {}
-		};
-		preflightInflight = run();
-		await preflightInflight;
-	});
+				await preflightInflight;
+			} finally {
+				preflightInflight = null;
+			}
+		})
+		// Without this the chain would both surface an unhandled rejection and
+		// stay rejected for good, so every later enqueuePreflight would chain off
+		// it and silently stop scanning. Each run already swallows its own errors;
+		// this only keeps one bad link from disabling the queue.
+		.catch(() => {});
 }
 
-// Builds the clickable "SynthID detected" badge for a queued image.
-function createSynthidBadge(detection: SynthidDetection): HTMLButtonElement {
+// Reads a file's SynthID declaration through the shared cache, choosing how
+// much of the file to read first.
+//
+// Below the large-input threshold the file is read once and the same buffer
+// answers both questions the pre-flight has: it is digested into the content
+// key the declaration is cached under, and it is searched for the declaration
+// itself. Processing reuses that digest too, so a queued file is read once here
+// and never again for its key. A digest the queue already holds is preferred
+// over deriving a second one from the bytes just read.
+//
+// At or above the threshold nothing is digested: hashing one would read the
+// whole file into memory for a declaration that only needs its two edge
+// windows, and with no key there is nothing to cache under, so the bounded
+// reader runs directly. Processing derives the digest later, when the
+// identical-output check needs one.
+//
+// A key the cache cannot trust never reaches it, because a collision would hand
+// one file another's declaration. On this path that is only the non-
+// cryptographic fallback fingerprint, since no digest at all is possible only in
+// the large-input branch above, and bypassing the cache costs the search rather
+// than the result.
+async function readSynthidMetadata(queued: QueuedFile): Promise<boolean> {
+	if (queued.file.size >= LARGE_INPUT_BYTES) return hasSynthidManifest(queued.file);
+	const buffer = await queued.file.arrayBuffer();
+	const digest = queued.inputHash ?? (await sha256HexFromBuffer(buffer));
+	if (queued.inputHash === undefined) queued.inputHash = digest;
+	if (!isContentDigest(digest)) return hasSynthidDeclarationInBytes(new Uint8Array(buffer));
+	return synthidMetadata.get(new Uint8Array(buffer), digest, 'synthidMetadata');
+}
+
+// Builds the badge shown on a queued file whose own metadata declares a
+// SynthID watermark. This is a read of what Google wrote into the container,
+// not a measurement of the watermark in the pixels, so the wording names the
+// source and says the pixel watermark was not measured. Clicking it turns on
+// media distortion, which is the honest thing to offer: the user has just been
+// told this file came from a model that watermarks its output, and the
+// distortion may disturb that watermark, but it is not verified to remove it
+// and may not. The option applies to the whole batch rather than just this
+// file, so the title says so rather than implying a per-file action.
+//
+// A running batch has already captured the options it will use, so the badge
+// locks with the rest of the queue controls: flipping the checkbox mid-batch
+// would only take effect on the next run, which reads as a dead control.
+function createSynthidBadge(): HTMLButtonElement {
 	const badge = document.createElement('button');
 	badge.type = 'button';
 	badge.className = 'file-item__synthid';
-	badge.title = `Statistical detector flagged this image (${Math.floor(detection.confidence * 100)}% confidence). Enable the SynthID option to attempt removal.`;
-	badge.textContent = 'SynthID detected';
+	badge.title = "This file's metadata carries Google's declaration that a SynthID watermark was applied. The badge reports that declaration, not a measurement of the watermark in the pixels. Click to turn on media distortion, which may disturb some embedded watermarks but is not verified to remove this one. The option applies to all inputs.";
+	badge.textContent = 'SynthID declared';
+	badge.disabled = isProcessing;
 	badge.addEventListener('click', () => {
-		synthidAttackInput.checked = true;
-		synthidAttackInput.dispatchEvent(new Event('change'));
+		distortAttackInput.checked = true;
+		distortAttackInput.dispatchEvent(new Event('change'));
 	});
 	return badge;
 }
 
-// Refreshes just one file item's badge after its detection resolves, without
-// re-rendering the whole (possibly paginated) list.
+// Refreshes just one file item's badge after its declaration scan resolves,
+// without re-rendering the whole (possibly paginated) list.
 function updateQueuedBadge(queued: QueuedFile): void {
 	const li = fileList.querySelector<HTMLElement>(`[data-id="${CSS.escape(queued.id)}"]`);
 	if (!li) return;
@@ -1580,33 +1313,9 @@ function updateQueuedBadge(queued: QueuedFile): void {
 	if (!info) return;
 	const existing = li.querySelector('.file-item__synthid');
 	if (existing) existing.remove();
-	if (queued.synthidDetected?.isWatermarked && queued.synthidDetected.conclusive) {
-		info.append(createSynthidBadge(queued.synthidDetected));
+	if (queued.synthidDeclared) {
+		info.append(createSynthidBadge());
 	}
-}
-
-// Appends the "SynthID check: input …, output …" verdict line to a result
-// item's info block, flagging it when the output is still watermarked.
-function appendSynthidVerdict(info: HTMLElement, check: SynthidCheckResult): void {
-	const { input, output } = check;
-	const formatVerdict = (detection: SynthidDetection) =>
-		// A size too small to carry the profile's carriers carries no
-		// trustworthy signal, so it reports as inconclusive rather than
-		// borrowing the confidence percentage. Floor, not round: a heuristic
-		// verdict should never display as 100%.
-		detection.conclusive
-			? `${detection.isWatermarked ? 'detected' : 'not detected'} (${Math.floor(detection.confidence * 100)}%)`
-			: 'inconclusive (size too small)';
-	const synthidLine = document.createElement('p');
-	synthidLine.className = 'result-item__synthid';
-	if (output?.isWatermarked && output.conclusive) synthidLine.classList.add('result-item__synthid--flagged');
-	synthidLine.textContent = `SynthID check: input ${formatVerdict(input)}, output ${output ? formatVerdict(output) : 'unavailable'}`;
-	const formatProfile = (detection: SynthidDetection) =>
-		!detection.conclusive
-			? `${detection.profileKey} (size too small for a trusted check)`
-			: detection.exactMatch ? detection.profileKey : `${detection.profileKey} (scaled match)`;
-	synthidLine.title = `Statistical carrier-phase detector tuned for Gemini model generations, not Google's own verifier. Profiles: input ${formatProfile(input)}, output ${output ? formatProfile(output) : 'unavailable'}.`;
-	info.append(synthidLine);
 }
 
 // Appends each warning from a result to its info block.
@@ -1671,7 +1380,6 @@ function updateResults(): void {
 			hash.title = `Input: ${result.inputHash}\nOutput: ${result.outputHash}`;
 
 			info.append(name, meta, hash);
-			if (result.synthidCheck) appendSynthidVerdict(info, result.synthidCheck);
 			if (result.warnings && result.warnings.length > 0) appendWarnings(info, result.warnings);
 
 			const download = document.createElement('button');
@@ -1707,7 +1415,6 @@ function updateResults(): void {
 				info.append(name, meta);
 			}
 
-			if (result.synthidCheck) appendSynthidVerdict(info, result.synthidCheck);
 			if (result.warnings && result.warnings.length > 0) appendWarnings(info, result.warnings);
 
 			const status = document.createElement('span');
@@ -1789,6 +1496,12 @@ async function processAllFiles(): Promise<void> {
 	if (queuedFiles.length === 0) return;
 
 	isProcessing = true;
+	// A batch reads the options once, at its start, so every option control and
+	// the declaration badge lock for its duration. Changing one mid-batch would
+	// take effect only on the next run, which reads as a control that accepted
+	// the change and then ignored it. The queue badge needs its own lock because
+	// it lives outside this fieldset.
+	optionsLock.disabled = true;
 	processAllBtn.disabled = true;
 	clearAllBtn.disabled = true;
 	fileInput.disabled = true;
@@ -1847,6 +1560,7 @@ async function processAllFiles(): Promise<void> {
 	} finally {
 		resumePreflights();
 		isProcessing = false;
+		optionsLock.disabled = false;
 		clearAllBtn.disabled = false;
 		fileInput.disabled = false;
 		updateFileList();
@@ -1857,10 +1571,11 @@ async function processAllFiles(): Promise<void> {
 function clearAll(): void {
 	if (isProcessing || isZipping) return;
 	preflightEpoch += 1;
-	// Drop cached verdicts with the queue so a long session does not retain
-	// detections for files the user has cleared. Verdicts for files removed
-	// individually stay cached until this full clear.
-	synthidVerdicts.clear();
+	// Drop cached declarations with the queue so a long session does not retain
+	// scans for files the user has cleared. Declarations for files removed
+	// individually stay cached until this full clear. Large inputs never enter
+	// the cache, so this holds only the small ones.
+	synthidMetadata.clear();
 	for (const queued of queuedFiles) {
 		URL.revokeObjectURL(queued.objectUrl);
 	}
@@ -1968,55 +1683,54 @@ function updateJpegQualityEnabled(): void {
 jpegRecompressInput.addEventListener('change', updateJpegControls);
 outputFormatRows.addEventListener('change', updateJpegQualityEnabled);
 
-synthidAttackInput.addEventListener('change', () => {
-	if (!synthidAttackInput.checked) synthidAdvancedExpanded = false;
-	updateSynthidAdvancedVisibility();
+distortAttackInput.addEventListener('change', () => {
+	if (!distortAttackInput.checked) distortAdvancedExpanded = false;
+	updateDistortAdvancedVisibility();
 });
 
-synthidAdvancedToggle.addEventListener('click', () => {
-	synthidAdvancedExpanded = !synthidAdvancedExpanded;
-	updateSynthidAdvancedVisibility();
+distortAdvancedToggle.addEventListener('click', () => {
+	distortAdvancedExpanded = !distortAdvancedExpanded;
+	updateDistortAdvancedVisibility();
 });
 
-function updateSynthidAdvancedVisibility(): void {
-	const enabled = synthidAttackInput.checked;
-	synthidScopeWrap.hidden = !enabled;
-	synthidAdvancedToggle.hidden = !enabled;
-	const expanded = enabled && synthidAdvancedExpanded;
-	synthidSettingsGroup.hidden = !expanded;
-	synthidAdvancedToggle.setAttribute('aria-expanded', String(expanded));
+function updateDistortAdvancedVisibility(): void {
+	const enabled = distortAttackInput.checked;
+	distortAdvancedToggle.hidden = !enabled;
+	const expanded = enabled && distortAdvancedExpanded;
+	distortSettingsGroup.hidden = !expanded;
+	distortAdvancedToggle.setAttribute('aria-expanded', String(expanded));
 }
 
-synthidPresetGroup.addEventListener('change', () => {
-	const preset = getSynthidPresetFromGroup();
-	if (preset) applySynthidPreset(preset);
+distortPresetGroup.addEventListener('change', () => {
+	const preset = getDistortPresetFromGroup();
+	if (preset) applyDistortPreset(preset);
 });
 
 // Manual adjustments no longer match any preset, so clear the selection.
-function clearSynthidPresetSelection(): void {
-	for (const radio of synthidPresetGroup.querySelectorAll<HTMLInputElement>('input[type="radio"]')) {
+function clearDistortPresetSelection(): void {
+	for (const radio of distortPresetGroup.querySelectorAll<HTMLInputElement>('input[type="radio"]')) {
 		radio.checked = false;
 	}
 }
 
-const synthidSliders = [
-	synthidElasticInput,
-	synthidSigmaInput,
-	synthidRotationInput,
-	synthidSqueezeInput,
-	synthidColorInput,
-	synthidNoiseInput,
-	synthidRoundsInput,
-	synthidQualityInput,
-	synthidPsnrFloorInput,
+const distortSliders = [
+	distortElasticInput,
+	distortSigmaInput,
+	distortRotationInput,
+	distortSqueezeInput,
+	distortColorInput,
+	distortNoiseInput,
+	distortRoundsInput,
+	distortQualityInput,
+	distortPsnrFloorInput,
 ];
-for (const slider of synthidSliders) {
+for (const slider of distortSliders) {
 	slider.addEventListener('input', () => {
-		clearSynthidPresetSelection();
-		refreshSynthidDisplays();
+		clearDistortPresetSelection();
+		refreshDistortDisplays();
 	});
 }
-synthidBilateralInput.addEventListener('change', clearSynthidPresetSelection);
+distortBilateralInput.addEventListener('change', clearDistortPresetSelection);
 
 function updateFilenamePanels(): void {
 	const mode = getSelectedRadioValue(filenameModeGroup) as ProcessingOptions['filenameMode'];
@@ -2047,8 +1761,8 @@ clearAllBtn.addEventListener('click', () => clearAll());
 blurRadiusInput.disabled = !applyBlurInput.checked;
 updateJpegControls();
 updateFilenamePanels();
-updateSynthidAdvancedVisibility();
-applySynthidPreset(SYNTHID_PRESETS.balanced);
+updateDistortAdvancedVisibility();
+applyDistortPreset(DISTORT_PRESETS.balanced);
 setProgress(0, 'Ready');
 
-export { processVideo, processAnimatedGif, detectBlobSynthid, verifyOutputSynthid, appendSynthidVerdict, processAllFiles };
+export { processVideo, processAnimatedGif, processAllFiles, createSynthidBadge };

@@ -12,7 +12,7 @@ export interface Bitmap {
 	data: Uint8ClampedArray;
 }
 
-export interface SynthidPreset {
+export interface DistortPreset {
 	elasticAlpha: number;
 	elasticSigma: number;
 	rotationJitter: number;
@@ -25,8 +25,12 @@ export interface SynthidPreset {
 	psnrFloor: number;
 }
 
-export interface SynthidOptions extends SynthidPreset {
+export interface DistortOptions extends DistortPreset {
 	enabled: boolean;
+	// Grid the luma-noise control steps on. Carried in the snapshot rather than
+	// read from the control at use time so processing stays independent of the
+	// DOM and advice about the setting cannot drift from the value applied.
+	lumaNoiseStep: number;
 }
 
 // Per-tile displacement plan. The integer offsets are the control values of
@@ -65,7 +69,7 @@ export interface ColorShift {
 // Random attack parameters generated once per media file so distortion is
 // consistent across every frame of an animated GIF, and shared by the static
 // image pipeline for the same purpose.
-export interface SynthidRandomState {
+export interface DistortRandomState {
 	tileShift: TileShiftState | null;
 	affine: AffineParams | null;
 	color: ColorShift | null;
@@ -75,12 +79,6 @@ export interface SynthidRandomState {
 	noiseSeed: number;
 }
 
-// Controls which inputs get the SynthID attack:
-// 'detected-no-video' runs it only on still images the detector flags;
-// 'detected' adds all videos (the detector does not cover video); 'all'
-// runs it on every input regardless of detection.
-export type SynthidScope = 'detected-no-video' | 'detected' | 'all';
-
 export interface ProcessingOptions {
 	clearLsb: boolean;
 	randomizeLsb: boolean;
@@ -88,8 +86,7 @@ export interface ProcessingOptions {
 	blurRadius: number;
 	jpegRecompress: boolean;
 	jpegQuality: number;
-	synthid: SynthidOptions;
-	synthidScope: SynthidScope;
+	distort: DistortOptions;
 	outputFormats: Record<string, string>;
 	filenameMode: 'suffix' | 'prefix' | 'hash';
 	outputSuffix: string;
@@ -115,30 +112,7 @@ export interface VideoOutputProfile {
 export interface ProcessingOutput {
 	blob: Blob;
 	warnings: string[];
-	synthidCheck?: SynthidCheckResult;
 	// Hash of the output blob when the processing path computed one for its
 	// own checks, so the caller can reuse it instead of hashing again.
 	outputHash?: string;
-}
-
-// Input and output SynthID verdicts for one processed file, when the media
-// type supports the statistical detector (still images and animated GIFs).
-export interface SynthidCheckResult {
-	input: SynthidDetection;
-	output: SynthidDetection | null;
-}
-
-export interface SynthidDetection {
-	isWatermarked: boolean;
-	confidence: number;
-	phaseMatch: number;
-	profileKey: string;
-	exactMatch: boolean;
-	// True when the verdict is trustworthy enough for callers to act on.
-	// Native matches and the loose closest-profile fallback are trusted; a
-	// clean scaled match is trusted while the input still carries the
-	// profile's carriers. Only a clean match too small to carry them cannot be
-	// vouched for, and callers must report it as inconclusive rather than
-	// detected or clean.
-	conclusive: boolean;
 }

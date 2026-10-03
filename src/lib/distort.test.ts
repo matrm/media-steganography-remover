@@ -1,34 +1,26 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Bitmap, SynthidDetection, SynthidOptions, SynthidRandomState } from './types';
+import type { Bitmap, DistortOptions, DistortRandomState } from './types';
 import { computePsnr } from './metrics';
 import { addLumaNoise } from './pixels';
 import { createSeededRandom } from './util';
 import {
-	SYNTHID_PRESETS,
-	applySynthidDistortionStages,
-	applySynthidPipeline,
-	applySynthidSmoothingStage,
-	buildSynthidRandomState,
-	buildSynthidVideoFilters,
+	DISTORT_PRESETS,
+	applyDistortStages,
+	applyDistortPipeline,
+	buildDistortRandomState,
+	buildDistortVideoFilters,
 	encodeStaticImage,
-	gateSynthidByDetection,
-	gateVideoSynthid,
 	gifQualityToMaxColors,
 	isSubLevelVideoNoise,
 	qualityFloorSkipWarning,
-	selectGifCheckIndices,
-	shouldRestoreBestDraw,
-	shouldRetrySynthidAttempt,
 	subLevelVideoNoiseWarning,
-} from './synthid';
-import { SYNTHID_CODEBOOK } from './synthid-codebook';
-import { detectSynthid } from './synthid-detect';
+} from './distort';
 
 afterEach(() => {
 	vi.restoreAllMocks();
 });
 
-function disabledOptions(): SynthidOptions {
+function disabledOptions(): DistortOptions {
 	return {
 		enabled: true,
 		elasticAlpha: 0,
@@ -37,6 +29,7 @@ function disabledOptions(): SynthidOptions {
 		squeezeFactor: 1,
 		colorAmount: 0,
 		lumaNoise: 0,
+		lumaNoiseStep: 0.1,
 		reencodeRounds: 0,
 		reencodeQuality: 88,
 		bilateral: false,
@@ -67,8 +60,8 @@ function stripyBitmap(width: number, height: number): Bitmap {
 	return bmp;
 }
 
-describe('SYNTHID_PRESETS', () => {
-	const keys: (keyof typeof SYNTHID_PRESETS.gentle)[] = [
+describe('DISTORT_PRESETS', () => {
+	const keys: (keyof typeof DISTORT_PRESETS.gentle)[] = [
 		'elasticAlpha',
 		'elasticSigma',
 		'rotationJitter',
@@ -82,7 +75,7 @@ describe('SYNTHID_PRESETS', () => {
 	];
 
 	it('defines complete parameter sets for every strength tier', () => {
-		for (const preset of Object.values(SYNTHID_PRESETS)) {
+		for (const preset of Object.values(DISTORT_PRESETS)) {
 			for (const key of keys) {
 				expect(preset[key]).toBeDefined();
 			}
@@ -96,7 +89,7 @@ describe('SYNTHID_PRESETS', () => {
 	});
 
 	it('keeps the tiers meaningfully distinct', () => {
-		const values = Object.values(SYNTHID_PRESETS).map((p) => p.elasticAlpha);
+		const values = Object.values(DISTORT_PRESETS).map((p) => p.elasticAlpha);
 		expect(new Set(values).size).toBe(3);
 	});
 });
@@ -122,76 +115,21 @@ describe('gifQualityToMaxColors', () => {
 	});
 });
 
-describe('selectGifCheckIndices', () => {
-	it('checks every frame of short animations', () => {
-		expect(selectGifCheckIndices(1)).toEqual([0]);
-		expect(selectGifCheckIndices(2)).toEqual([0, 1]);
-		expect(selectGifCheckIndices(3)).toEqual([0, 1, 2]);
-	});
-
-	it('samples the first, middle, and last frames of longer animations', () => {
-		expect(selectGifCheckIndices(4)).toEqual([0, 2, 3]);
-		expect(selectGifCheckIndices(5)).toEqual([0, 2, 4]);
-	});
-
-	it('returns no indices when there are no frames', () => {
-		expect(selectGifCheckIndices(0)).toEqual([]);
-	});
-});
-
-describe('shouldRetrySynthidAttempt', () => {
-	it('retries a flagged output while attempts remain', () => {
-		expect(shouldRetrySynthidAttempt(true, true, 0, 3)).toBe(true);
-		expect(shouldRetrySynthidAttempt(true, true, 1, 3)).toBe(true);
-	});
-
-	it('stops on the last attempt and keeps that result', () => {
-		expect(shouldRetrySynthidAttempt(true, true, 2, 3)).toBe(false);
-	});
-
-	it('never retries a clean output', () => {
-		expect(shouldRetrySynthidAttempt(true, false, 0, 3)).toBe(false);
-	});
-
-	it('never retries when the input was not watermarked', () => {
-		expect(shouldRetrySynthidAttempt(false, true, 0, 3)).toBe(false);
-	});
-
-	it('treats a single-attempt budget as no retry', () => {
-		expect(shouldRetrySynthidAttempt(true, true, 0, 1)).toBe(false);
-	});
-});
-
-describe('shouldRestoreBestDraw', () => {
-	it('replaces a more watermarked canvas draw with the best measured one', () => {
-		expect(shouldRestoreBestDraw({ confidence: 0.2 }, { confidence: 0.8 })).toBe(true);
-	});
-
-	it('keeps a cleaner or equally clean canvas draw', () => {
-		expect(shouldRestoreBestDraw({ confidence: 0.8 }, { confidence: 0.2 })).toBe(false);
-		expect(shouldRestoreBestDraw({ confidence: 0.2 }, { confidence: 0.2 })).toBe(false);
-	});
-
-	it('replaces an unmeasured canvas draw with the best measured one', () => {
-		expect(shouldRestoreBestDraw({ confidence: 0.9 }, null)).toBe(true);
-	});
-});
-
-describe('buildSynthidRandomState', () => {
+describe('buildDistortRandomState', () => {
 	it('disables tile shifts below one whole pixel instead of shifting by zero', () => {
-		const off = buildSynthidRandomState(64, 64, { ...disabledOptions(), elasticAlpha: 0.5 });
+		const off = buildDistortRandomState(64, 64, { ...disabledOptions(), elasticAlpha: 0.5 });
 		expect(off.tileShift).toBeNull();
-		const on = buildSynthidRandomState(64, 64, { ...disabledOptions(), elasticAlpha: 1.2 });
+		const on = buildDistortRandomState(64, 64, { ...disabledOptions(), elasticAlpha: 1.2 });
 		expect(on.tileShift).not.toBeNull();
 	});
 
 	it('draws a finite per-file noise seed', () => {
-		const state = buildSynthidRandomState(64, 64, disabledOptions());
+		const state = buildDistortRandomState(64, 64, disabledOptions());
 		expect(Number.isFinite(state.noiseSeed)).toBe(true);
 	});
 
 	it('omits video lens correction below one whole pixel like the image path', () => {
-		const filters = buildSynthidVideoFilters(
+		const filters = buildDistortVideoFilters(
 			{ ...disabledOptions(), elasticAlpha: 0.5 },
 			{ width: 1920, height: 1080 }
 		);
@@ -200,89 +138,13 @@ describe('buildSynthidRandomState', () => {
 
 	it('applies identical noise to every frame sharing one state', async () => {
 		const options = { ...disabledOptions(), lumaNoise: 3 };
-		const state: SynthidRandomState = { tileShift: null, affine: null, color: null, noiseSeed: 4242 };
+		const state: DistortRandomState = { tileShift: null, affine: null, color: null, noiseSeed: 4242 };
 		const first = solidGray(16, 16);
 		const second = solidGray(16, 16);
-		await applySynthidDistortionStages(first, state, options, false, []);
-		await applySynthidDistortionStages(second, state, options, false, []);
+		await applyDistortStages(first, state, options, false, []);
+		await applyDistortStages(second, state, options, false, []);
 		expect(Array.from(first.data)).toEqual(Array.from(second.data));
 		expect(Array.from(first.data)).not.toEqual(Array.from(solidGray(16, 16).data));
-	});
-});
-
-describe('SynthID scope gating', () => {
-	const detection = (isWatermarked: boolean): SynthidDetection => ({
-		isWatermarked,
-		confidence: isWatermarked ? 0.9 : 0.1,
-		phaseMatch: isWatermarked ? 0.7 : 0.4,
-		profileKey: 'test/64x64',
-		exactMatch: true,
-		conclusive: true,
-	});
-
-	it('skips clean inputs, warns on failed detection, and never gates the all scope', () => {
-		const enabled = { ...disabledOptions(), enabled: true };
-
-		const cleanWarnings: string[] = [];
-		expect(gateSynthidByDetection(enabled, 'detected', detection(false), cleanWarnings).enabled).toBe(false);
-		expect(cleanWarnings).toEqual([]);
-
-		const failedWarnings: string[] = [];
-		expect(gateSynthidByDetection(enabled, 'detected', null, failedWarnings).enabled).toBe(false);
-		expect(failedWarnings).toHaveLength(1);
-
-		const flaggedWarnings: string[] = [];
-		expect(gateSynthidByDetection(enabled, 'detected', detection(true), flaggedWarnings).enabled).toBe(true);
-		expect(flaggedWarnings).toEqual([]);
-
-		expect(gateSynthidByDetection(enabled, 'all', null, []).enabled).toBe(true);
-		expect(gateSynthidByDetection({ ...enabled, enabled: false }, 'detected', null, []).enabled).toBe(false);
-	});
-
-	it('discloses an inconclusive skip instead of treating the image as clean', () => {
-		const enabled = { ...disabledOptions(), enabled: true };
-		const inconclusive: SynthidDetection = { ...detection(false), conclusive: false };
-		const warnings: string[] = [];
-		expect(gateSynthidByDetection(enabled, 'detected', inconclusive, warnings).enabled).toBe(false);
-		expect(warnings).toHaveLength(1);
-		expect(warnings[0]).toContain('inconclusive');
-		// The All inputs scope never consults the verdict, so it stays quiet.
-		expect(gateSynthidByDetection(enabled, 'all', inconclusive, []).enabled).toBe(true);
-	});
-
-	it('does not let a flagged inconclusive verdict run the attack silently', () => {
-		const enabled = { ...disabledOptions(), enabled: true };
-		// A clean match too small to carry the codebook carriers can still
-		// cross the phase threshold by chance, so an inconclusive flag must
-		// not be treated as a detection and quietly run removal.
-		const inconclusive: SynthidDetection = { ...detection(true), conclusive: false };
-		const warnings: string[] = [];
-		expect(gateSynthidByDetection(enabled, 'detected', inconclusive, warnings).enabled).toBe(false);
-		expect(warnings).toHaveLength(1);
-		expect(warnings[0]).toContain('inconclusive');
-		// The All inputs scope still applies removal without consulting it.
-		expect(gateSynthidByDetection(enabled, 'all', inconclusive, []).enabled).toBe(true);
-	});
-
-	it('keeps the scope-only rule for real videos, which the detector cannot read', () => {
-		const enabled = { ...disabledOptions(), enabled: true };
-		expect(gateVideoSynthid(true, enabled, 'detected', null, []).enabled).toBe(true);
-		expect(gateVideoSynthid(true, enabled, 'all', null, []).enabled).toBe(true);
-		expect(gateVideoSynthid(true, enabled, 'detected-no-video', null, []).enabled).toBe(false);
-	});
-
-	it('gates image inputs routed through FFmpeg by their verdict', () => {
-		const enabled = { ...disabledOptions(), enabled: true };
-		// A detected GIF converted to MP4 still gets removal under the
-		// no-video scope, because the input itself is a detected image.
-		expect(gateVideoSynthid(false, enabled, 'detected-no-video', detection(true), []).enabled).toBe(true);
-		// A clean GIF converted to MP4 is not attacked under the detected scope.
-		expect(gateVideoSynthid(false, enabled, 'detected', detection(false), []).enabled).toBe(false);
-		expect(gateVideoSynthid(false, enabled, 'all', detection(false), []).enabled).toBe(true);
-
-		const warnings: string[] = [];
-		expect(gateVideoSynthid(false, enabled, 'detected', null, warnings).enabled).toBe(false);
-		expect(warnings).toHaveLength(1);
 	});
 });
 
@@ -301,7 +163,7 @@ describe('isSubLevelVideoNoise', () => {
 		// rounding, so both paths leave the pixels alone.
 		expect(isSubLevelVideoNoise(0.4)).toBe(true);
 		expect(isSubLevelVideoNoise(0.5)).toBe(true);
-		const filters = buildSynthidVideoFilters({ ...disabledOptions(), lumaNoise: 0.5 }, null);
+		const filters = buildDistortVideoFilters({ ...disabledOptions(), lumaNoise: 0.5 }, null);
 		expect(filters.some((f) => f.startsWith('noise='))).toBe(false);
 	});
 
@@ -335,15 +197,15 @@ describe('isSubLevelVideoNoise', () => {
 	});
 });
 
-describe('buildSynthidVideoFilters', () => {
+describe('buildDistortVideoFilters', () => {
 	it('returns an empty chain when every stage is off', () => {
-		const filters = buildSynthidVideoFilters(disabledOptions(), { width: 1920, height: 1080 });
+		const filters = buildDistortVideoFilters(disabledOptions(), { width: 1920, height: 1080 });
 		expect(filters).toEqual([]);
 	});
 
 	it('omits lens correction when frame size is unknown but keeps other stages', () => {
 		const options = { ...disabledOptions(), lumaNoise: 2 };
-		const filters = buildSynthidVideoFilters(options, null);
+		const filters = buildDistortVideoFilters(options, null);
 		expect(filters.some((f) => f.startsWith('lenscorrection='))).toBe(false);
 		expect(filters).toContain(`noise=c0s=5:allf=t+u`);
 	});
@@ -353,7 +215,7 @@ describe('buildSynthidVideoFilters', () => {
 		const width = 1920;
 		const height = 1080;
 		const expectedK1 = Math.min(0.25, (2 * 2) / Math.hypot(width, height));
-		const filters = buildSynthidVideoFilters(options, { width, height });
+		const filters = buildDistortVideoFilters(options, { width, height });
 		const lens = filters.find((f) => f.startsWith('lenscorrection='))!;
 		const match = /k1=(0\.\d+):i=bilinear/.exec(lens);
 		expect(match).not.toBeNull();
@@ -362,7 +224,7 @@ describe('buildSynthidVideoFilters', () => {
 
 	it('caps k1 at the filter limit for extreme budgets on tiny frames', () => {
 		const options = { ...disabledOptions(), elasticAlpha: 900 };
-		const filters = buildSynthidVideoFilters(options, { width: 10, height: 10 });
+		const filters = buildDistortVideoFilters(options, { width: 10, height: 10 });
 		const lens = filters.find((f) => f.startsWith('lenscorrection='))!;
 		expect(lens).toContain('k1=0.250000');
 	});
@@ -371,7 +233,7 @@ describe('buildSynthidVideoFilters', () => {
 		vi.spyOn(Math, 'random').mockReturnValue(0.75);
 		const jitterDeg = 1.4;
 		const options = { ...disabledOptions(), rotationJitter: jitterDeg };
-		const filters = buildSynthidVideoFilters(options, { width: 1280, height: 720 });
+		const filters = buildDistortVideoFilters(options, { width: 1280, height: 720 });
 		expect(filters).toHaveLength(3);
 		expect(filters[0].startsWith('scale=')).toBe(true);
 		const rotate = filters[1];
@@ -385,7 +247,7 @@ describe('buildSynthidVideoFilters', () => {
 	it('crops rather than scales after rotating so corner fill is discarded', () => {
 		vi.spyOn(Math, 'random').mockReturnValue(0.75);
 		const options = { ...disabledOptions(), rotationJitter: 0.75 };
-		const filters = buildSynthidVideoFilters(options, { width: 1920, height: 1080 });
+		const filters = buildDistortVideoFilters(options, { width: 1920, height: 1080 });
 		const afterRotate = filters.slice(filters.findIndex((f) => f.startsWith('rotate=')) + 1);
 		expect(afterRotate.length).toBeGreaterThan(0);
 		expect(afterRotate.some((f) => f.startsWith('scale='))).toBe(false);
@@ -396,11 +258,11 @@ describe('buildSynthidVideoFilters', () => {
 
 	it('adds squeeze down/up scale pairs only when squeezing is requested', () => {
 		const active = { ...disabledOptions(), squeezeFactor: 0.9 };
-		const squeezeFilters = buildSynthidVideoFilters(active, { width: 640, height: 480 })
+		const squeezeFilters = buildDistortVideoFilters(active, { width: 640, height: 480 })
 			.filter((f) => f.startsWith('scale='));
 		expect(squeezeFilters).toHaveLength(2);
 
-		const inactive = buildSynthidVideoFilters({ ...disabledOptions(), squeezeFactor: 1 }, null);
+		const inactive = buildDistortVideoFilters({ ...disabledOptions(), squeezeFactor: 1 }, null);
 		expect(inactive.length).toBe(0);
 	});
 
@@ -410,7 +272,7 @@ describe('buildSynthidVideoFilters', () => {
 		mockFirstRandom([0.999999, 0.5, 0.5, 0.5]);
 		const amount = 1.4;
 		const options = { ...disabledOptions(), colorAmount: amount };
-		const eq = buildSynthidVideoFilters(options, null)
+		const eq = buildDistortVideoFilters(options, null)
 			.find((f) => f.startsWith('eq='))!;
 		const brightness = parseFloat(/brightness=(-?[0-9.]+)/.exec(eq)![1]);
 		const expected = ((2 / 255) * (219 / 255)) * amount;
@@ -428,14 +290,14 @@ describe('buildSynthidVideoFilters', () => {
 			[90, 99],
 		] as const) {
 			const options = { ...disabledOptions(), lumaNoise };
-			const filter = buildSynthidVideoFilters(options, null).find((f) => f.startsWith('noise='))!;
+			const filter = buildDistortVideoFilters(options, null).find((f) => f.startsWith('noise='))!;
 			expect(filter).toBe(`noise=c0s=${expectedStrength}:allf=t+u`);
 		}
 	});
 
 	it('skips sub-level noise that would emit a no-op filter', () => {
 		const options = { ...disabledOptions(), lumaNoise: 0.4 };
-		const filters = buildSynthidVideoFilters(options, null);
+		const filters = buildDistortVideoFilters(options, null);
 		expect(filters.some((f) => f.startsWith('noise='))).toBe(false);
 	});
 
@@ -444,7 +306,7 @@ describe('buildSynthidVideoFilters', () => {
 		// chroma untouched. An all-planes strength noises U and V as well
 		// and adds color speckle the still-image pipeline never produces.
 		const options = { ...disabledOptions(), lumaNoise: 5 };
-		const filter = buildSynthidVideoFilters(options, null).find((f) => f.startsWith('noise='))!;
+		const filter = buildDistortVideoFilters(options, null).find((f) => f.startsWith('noise='))!;
 		expect(filter).not.toContain('alls=');
 		expect(filter).toMatch(/c0s=/);
 	});
@@ -454,7 +316,7 @@ describe('buildSynthidVideoFilters', () => {
 		// limited-range luma applies in RGB. Without it the uniform integer
 		// noise overshoots the image path's bounded +/-lumaNoise levels.
 		const options = { ...disabledOptions(), lumaNoise: 5 };
-		const filter = buildSynthidVideoFilters(options, null).find((f) => f.startsWith('noise='))!;
+		const filter = buildDistortVideoFilters(options, null).find((f) => f.startsWith('noise='))!;
 		const strength = Number.parseInt(/noise=\w+=(\d+)/.exec(filter)![1], 10);
 		const rgbAmplitude = Math.floor(strength / 2) * (255 / 219);
 		expect(rgbAmplitude).toBeLessThanOrEqual(options.lumaNoise);
@@ -466,7 +328,7 @@ describe('buildSynthidVideoFilters', () => {
 		// RGB noise, overshooting the setting itself. The bound test below
 		// pins how far that overshoot may reach.
 		const options = { ...disabledOptions(), lumaNoise: 0.6 };
-		const filter = buildSynthidVideoFilters(options, null).find((f) => f.startsWith('noise='))!;
+		const filter = buildDistortVideoFilters(options, null).find((f) => f.startsWith('noise='))!;
 		const strength = Number.parseInt(/noise=\w+=(\d+)/.exec(filter)![1], 10);
 		const rgbAmplitude = Math.floor(strength / 2) * (255 / 219);
 		expect(rgbAmplitude).toBeGreaterThan(options.lumaNoise);
@@ -479,7 +341,7 @@ describe('buildSynthidVideoFilters', () => {
 		// cap, which clips the amplitude of settings past about 57.
 		for (const lumaNoise of [0.6, 1, 1.4, 1.5, 2.5, 5, 20, 50]) {
 			const options = { ...disabledOptions(), lumaNoise };
-			const filter = buildSynthidVideoFilters(options, null).find((f) => f.startsWith('noise='))!;
+			const filter = buildDistortVideoFilters(options, null).find((f) => f.startsWith('noise='))!;
 			const strength = Number.parseInt(/noise=\w+=(\d+)/.exec(filter)![1], 10);
 			const rgbAmplitude = Math.floor(strength / 2) * (255 / 219);
 			expect(Math.abs(rgbAmplitude - lumaNoise)).toBeLessThanOrEqual(0.5 * (255 / 219));
@@ -489,7 +351,7 @@ describe('buildSynthidVideoFilters', () => {
 	it('emits a hue shift alongside eq for color amounts', () => {
 		mockFirstRandom([0.5, 0.5, 0.5, 0.999999]);
 		const options = { ...disabledOptions(), colorAmount: 1 };
-		const filters = buildSynthidVideoFilters(options, null);
+		const filters = buildDistortVideoFilters(options, null);
 		const hue = filters.find((f) => f.startsWith('hue='))!;
 		expect(hue).toContain('h=');
 		const deg = parseFloat(/h=(-?[0-9.]+)/.exec(hue)![1]);
@@ -499,11 +361,11 @@ describe('buildSynthidVideoFilters', () => {
 	it('uses an injected random source instead of the global Math.random', () => {
 		const options = { ...disabledOptions(), rotationJitter: 1.4, colorAmount: 1 };
 		const globalDraw = vi.spyOn(Math, 'random').mockReturnValue(0.75);
-		const fromGlobal = buildSynthidVideoFilters(options, { width: 1280, height: 720 });
+		const fromGlobal = buildDistortVideoFilters(options, { width: 1280, height: 720 });
 		globalDraw.mockClear();
 		// A different injected value must yield a different chain, proving the
 		// source is actually consumed rather than ignored for Math.random.
-		const fromInjected = buildSynthidVideoFilters(options, { width: 1280, height: 720 }, () => 0.25);
+		const fromInjected = buildDistortVideoFilters(options, { width: 1280, height: 720 }, () => 0.25);
 		expect(fromInjected).not.toEqual(fromGlobal);
 		expect(globalDraw).not.toHaveBeenCalled();
 	});
@@ -533,7 +395,7 @@ describe('video squeeze geometry', () => {
 		[1024, 768, 0.00001],
 		[1024, 768, Number.MIN_VALUE],
 	])('restores original even dimensions for %i x %i at factor %s', (width, height, squeezeFactor) => {
-		const filters = buildSynthidVideoFilters({ ...disabledOptions(), squeezeFactor }, { width, height });
+		const filters = buildDistortVideoFilters({ ...disabledOptions(), squeezeFactor }, { width, height });
 		expect(filters).toHaveLength(2);
 		let currentWidth = width;
 		let currentHeight = height;
@@ -554,7 +416,7 @@ describe('video squeeze geometry', () => {
 
 	it('skips squeeze with a warning when original dimensions are unavailable', () => {
 		const warnings: string[] = [];
-		const filters = buildSynthidVideoFilters(
+		const filters = buildDistortVideoFilters(
 			{ ...disabledOptions(), squeezeFactor: 0.9, lumaNoise: 2 }, null, () => 0.5, warnings
 		);
 		expect(filters).toEqual(['noise=c0s=5:allf=t+u']);
@@ -565,7 +427,7 @@ describe('video squeeze geometry', () => {
 
 	it.each([0, -1, 1, 2, NaN, Infinity])('ignores inactive or invalid factor %s', (squeezeFactor) => {
 		const warnings: string[] = [];
-		expect(buildSynthidVideoFilters({ ...disabledOptions(), squeezeFactor }, null, () => 0.5, warnings)).toEqual([]);
+		expect(buildDistortVideoFilters({ ...disabledOptions(), squeezeFactor }, null, () => 0.5, warnings)).toEqual([]);
 		expect(warnings).toEqual([]);
 	});
 });
@@ -577,7 +439,7 @@ describe('video rotation geometry', () => {
 		const height = 1080;
 		const jitterDeg = 3;
 		const options = { ...disabledOptions(), rotationJitter: jitterDeg };
-		const filters = buildSynthidVideoFilters(options, { width, height });
+		const filters = buildDistortVideoFilters(options, { width, height });
 		const scaleFilter = filters.find((f) => f.startsWith('scale='));
 		const cropFilter = filters.find((f) => f.startsWith('crop='));
 		expect(scaleFilter).toBeDefined();
@@ -604,7 +466,7 @@ describe('video rotation geometry', () => {
 
 	it('skips rotation with a warning when original dimensions are unavailable', () => {
 		const warnings: string[] = [];
-		const filters = buildSynthidVideoFilters(
+		const filters = buildDistortVideoFilters(
 			{ ...disabledOptions(), rotationJitter: 3, lumaNoise: 2 }, null, () => 0.75, warnings
 		);
 		expect(filters).toEqual(['noise=c0s=5:allf=t+u']);
@@ -619,7 +481,7 @@ describe('video lens distortion edge handling', () => {
 		const width = 1920;
 		const height = 1080;
 		const options = { ...disabledOptions(), elasticAlpha: 2 };
-		const filters = buildSynthidVideoFilters(options, { width, height });
+		const filters = buildDistortVideoFilters(options, { width, height });
 		const lensIndex = filters.findIndex((f) => f.startsWith('lenscorrection='));
 		expect(lensIndex).toBeGreaterThan(-1);
 		const match = /k1=([0-9.]+):i=bilinear/.exec(filters[lensIndex]);
@@ -657,9 +519,9 @@ describe('quality gating', () => {
 		const before = new Uint8ClampedArray(bmp.data);
 		// All-negative extreme noise on flat gray collapses PSNR far below any floor.
 		vi.spyOn(Math, 'random').mockReturnValue(0);
-		const state = buildSynthidRandomState(bmp.width, bmp.height, disabledOptions());
+		const state = buildDistortRandomState(bmp.width, bmp.height, disabledOptions());
 		const warnings: string[] = [];
-		await applySynthidDistortionStages(
+		await applyDistortStages(
 			bmp,
 			state,
 			{ ...disabledOptions(), lumaNoise: 80 },
@@ -680,9 +542,9 @@ describe('quality gating', () => {
 		const before = new Uint8ClampedArray(bmp.data);
 		vi.spyOn(Math, 'random').mockReturnValue(0.75);
 		const options = { ...disabledOptions(), rotationJitter: 3, psnrFloor: 40 };
-		const state = buildSynthidRandomState(bmp.width, bmp.height, options);
+		const state = buildDistortRandomState(bmp.width, bmp.height, options);
 		const warnings: string[] = [];
-		await applySynthidDistortionStages(bmp, state, options, true, warnings);
+		await applyDistortStages(bmp, state, options, true, warnings);
 		expect(Array.from(bmp.data)).not.toEqual(Array.from(before));
 		expect(warnings).toEqual([]);
 	});
@@ -691,9 +553,9 @@ describe('quality gating', () => {
 		vi.spyOn(Math, 'random').mockReturnValue(0);
 		const bmp = solidGray(16, 16);
 		const before = new Uint8ClampedArray(bmp.data);
-		const state = buildSynthidRandomState(bmp.width, bmp.height, disabledOptions());
+		const state = buildDistortRandomState(bmp.width, bmp.height, disabledOptions());
 		const warnings: string[] = [];
-		await applySynthidDistortionStages(
+		await applyDistortStages(
 			bmp,
 			state,
 			{ ...disabledOptions(), lumaNoise: 80 },
@@ -708,9 +570,9 @@ describe('quality gating', () => {
 		const bmp = solidGray(32, 32);
 		const before = new Uint8ClampedArray(bmp.data);
 		vi.spyOn(Math, 'random').mockReturnValue(0.999999);
-		const state = buildSynthidRandomState(bmp.width, bmp.height, disabledOptions());
+		const state = buildDistortRandomState(bmp.width, bmp.height, disabledOptions());
 		const warnings: string[] = [];
-		await applySynthidDistortionStages(
+		await applyDistortStages(
 			bmp,
 			state,
 			{ ...disabledOptions(), lumaNoise: 0.9, psnrFloor: 20 },
@@ -724,9 +586,9 @@ describe('quality gating', () => {
 	it('skips stages whose state or options leave them empty', async () => {
 		const bmp = solidGray(4, 4);
 		const before = new Uint8ClampedArray(bmp.data);
-		const state = buildSynthidRandomState(bmp.width, bmp.height, disabledOptions());
+		const state = buildDistortRandomState(bmp.width, bmp.height, disabledOptions());
 		const warnings: string[] = [];
-		await applySynthidDistortionStages(bmp, state, disabledOptions(), true, warnings);
+		await applyDistortStages(bmp, state, disabledOptions(), true, warnings);
 		expect(Array.from(bmp.data)).toEqual(Array.from(before));
 		expect(warnings).toEqual([]);
 	});
@@ -745,9 +607,9 @@ describe('quality gating', () => {
 		const bmp = { width: 16, height: 16, data };
 		const before = new Uint8ClampedArray(bmp.data);
 		vi.spyOn(Math, 'random').mockReturnValue(0);
-		const state = buildSynthidRandomState(bmp.width, bmp.height, disabledOptions());
+		const state = buildDistortRandomState(bmp.width, bmp.height, disabledOptions());
 		const warnings: string[] = [];
-		await applySynthidDistortionStages(
+		await applyDistortStages(
 			bmp,
 			state,
 			{ ...disabledOptions(), lumaNoise: 80 },
@@ -784,9 +646,9 @@ describe('quality gating', () => {
 		}
 		const bmp: Bitmap = { width, height, data };
 		const before = new Uint8ClampedArray(bmp.data);
-		const state: SynthidRandomState = { tileShift: null, affine: null, color: null, noiseSeed: 0 };
+		const state: DistortRandomState = { tileShift: null, affine: null, color: null, noiseSeed: 0 };
 		const warnings: string[] = [];
-		await applySynthidDistortionStages(
+		await applyDistortStages(
 			bmp,
 			state,
 			{ ...disabledOptions(), squeezeFactor: 0.9, psnrFloor: 10 },
@@ -800,82 +662,10 @@ describe('quality gating', () => {
 	});
 });
 
-// Builds an image carrying the 32 strongest green carriers of the real
-// codebook profile at the given size, so the detector reports a watermarked
-// input and the attack has something meaningful to disrupt.
-function watermarkedToneBitmap(width: number, height: number): Bitmap {
-	const profile = SYNTHID_CODEBOOK.profiles.find((candidate) => candidate.w === width && candidate.h === height);
-	if (!profile) throw new Error(`No codebook profile for ${width}x${height}`);
-	const binary = atob(profile.channels[1]);
-	const bins: { fy: number; fx: number; phase: number }[] = [];
-	for (let offset = 0; offset + 7 <= binary.length && bins.length < 32; offset += 7) {
-		bins.push({
-			fy: binary.charCodeAt(offset) | (binary.charCodeAt(offset + 1) << 8),
-			fx: binary.charCodeAt(offset + 2) | (binary.charCodeAt(offset + 3) << 8),
-			phase: (((binary.charCodeAt(offset + 5) | (binary.charCodeAt(offset + 6) << 8)) << 16) >> 16) / 1000,
-		});
-	}
-	const data = new Uint8ClampedArray(width * height * 4);
-	for (let y = 0; y < height; y += 1) {
-		for (let x = 0; x < width; x += 1) {
-			let value = 128;
-			for (const bin of bins) {
-				value += 3 * Math.cos(2 * Math.PI * (bin.fy * y / height + bin.fx * x / width) + bin.phase);
-			}
-			const i = (y * width + x) * 4;
-			data[i] = value;
-			data[i + 1] = value;
-			data[i + 2] = value;
-			data[i + 3] = 255;
-		}
-	}
-	return { width, height, data };
-}
-
-describe('pipeline efficacy', () => {
-	it('lowers detector confidence on a synthetic watermark', async () => {
-		// Seeded draws keep the per-file attack state reproducible; real
-		// Math.random would vary the attack strength with every process and
-		// make the confidence comparison a coin toss.
-		vi.spyOn(Math, 'random').mockImplementation(createSeededRandom(12345));
-		const options: SynthidOptions = { enabled: true, ...SYNTHID_PRESETS.balanced };
-		const before = await detectSynthid(watermarkedToneBitmap(1024, 1024));
-		expect(before.isWatermarked).toBe(true);
-
-		// Ungated: every stage applies.
-		const ungated = watermarkedToneBitmap(1024, 1024);
-		await applySynthidDistortionStages(
-			ungated,
-			buildSynthidRandomState(ungated.width, ungated.height, options),
-			options,
-			false,
-			[]
-		);
-		await applySynthidSmoothingStage(ungated, options, false, []);
-		const ungatedDetection = await detectSynthid(ungated);
-
-		// Gated: the quality floor may roll stages back, but the attack should
-		// still reduce detectability.
-		const gated = watermarkedToneBitmap(1024, 1024);
-		await applySynthidDistortionStages(
-			gated,
-			buildSynthidRandomState(gated.width, gated.height, options),
-			options,
-			true,
-			[]
-		);
-		await applySynthidSmoothingStage(gated, options, true, []);
-		const gatedDetection = await detectSynthid(gated);
-
-		expect(ungatedDetection.confidence).toBeLessThan(before.confidence);
-		expect(gatedDetection.confidence).toBeLessThan(before.confidence);
-	}, 60000);
-});
-
 // ---------------------------------------------------------------------------
 // Canvas-backed pipeline tests
 //
-// applySynthidPipeline and encodeStaticImage drive a canvas 2D context,
+// applyDistortPipeline and encodeStaticImage drive a canvas 2D context,
 // canvas.toBlob and createImageBitmap, so they need a DOM. The fakes below
 // back a canvas with a plain RGBA buffer and route every encode and decode
 // through an injectable pixel transform, letting the tests simulate lossless
@@ -1053,12 +843,12 @@ describe('canvas pipeline', () => {
 		vi.unstubAllGlobals();
 	});
 
-	describe('applySynthidPipeline', () => {
+	describe('applyDistortPipeline', () => {
 		it('applies the gated distortion stages to the canvas in place', async () => {
 			const canvas = texturedCanvas(48, 32);
 			const before = new Uint8ClampedArray(canvas.data);
 			const warnings: string[] = [];
-			await applySynthidPipeline(asCanvas(canvas), { ...disabledOptions(), lumaNoise: 2 }, warnings);
+			await applyDistortPipeline(asCanvas(canvas), { ...disabledOptions(), lumaNoise: 2 }, warnings);
 			expect(Array.from(canvas.data)).not.toEqual(Array.from(before));
 			expect(canvas.toBlobCalls).toHaveLength(0);
 			expect(warnings).toEqual([]);
@@ -1068,7 +858,7 @@ describe('canvas pipeline', () => {
 			const canvas = texturedCanvas(8, 8);
 			canvas.contextAvailable = false;
 			const before = new Uint8ClampedArray(canvas.data);
-			await applySynthidPipeline(asCanvas(canvas), disabledOptions(), []);
+			await applyDistortPipeline(asCanvas(canvas), disabledOptions(), []);
 			expect(Array.from(canvas.data)).toEqual(Array.from(before));
 			expect(canvas.toBlobCalls).toHaveLength(0);
 		});
@@ -1078,7 +868,7 @@ describe('canvas pipeline', () => {
 			const canvas = texturedCanvas(32, 32);
 			const before = new Uint8ClampedArray(canvas.data);
 			const warnings: string[] = [];
-			await applySynthidPipeline(asCanvas(canvas), {
+			await applyDistortPipeline(asCanvas(canvas), {
 				...disabledOptions(),
 				reencodeRounds: 3,
 				reencodeQuality: 90,
@@ -1094,7 +884,7 @@ describe('canvas pipeline', () => {
 			const canvas = texturedCanvas(32, 32);
 			const before = new Uint8ClampedArray(canvas.data);
 			const warnings: string[] = [];
-			await applySynthidPipeline(asCanvas(canvas), {
+			await applyDistortPipeline(asCanvas(canvas), {
 				...disabledOptions(),
 				reencodeRounds: 2,
 				reencodeQuality: 90,
@@ -1108,7 +898,7 @@ describe('canvas pipeline', () => {
 		it('picks the alpha-preserving encoder only for transparent canvases', async () => {
 			const transparent = texturedCanvas(8, 8);
 			transparent.data[3] = 0;
-			await applySynthidPipeline(asCanvas(transparent), {
+			await applyDistortPipeline(asCanvas(transparent), {
 				...disabledOptions(),
 				reencodeRounds: 1,
 				reencodeQuality: 90,
@@ -1117,7 +907,7 @@ describe('canvas pipeline', () => {
 			expect(transparent.toBlobCalls[0].mime).toBe('image/webp');
 
 			const opaque = texturedCanvas(8, 8);
-			await applySynthidPipeline(asCanvas(opaque), {
+			await applyDistortPipeline(asCanvas(opaque), {
 				...disabledOptions(),
 				reencodeRounds: 1,
 				reencodeQuality: 90,
@@ -1136,7 +926,7 @@ describe('canvas pipeline', () => {
 			for (let i = 0; i < canvas.data.length / 2; i += 4) canvas.data[i + 3] = 0;
 			const before = new Uint8ClampedArray(canvas.data);
 			const warnings: string[] = [];
-			await applySynthidPipeline(asCanvas(canvas), {
+			await applyDistortPipeline(asCanvas(canvas), {
 				...disabledOptions(),
 				reencodeRounds: 2,
 				reencodeQuality: 90,
@@ -1154,13 +944,13 @@ describe('canvas pipeline', () => {
 			const canvas = texturedCanvas(8, 8);
 			const before = new Uint8ClampedArray(canvas.data);
 			const warnings: string[] = [];
-			await applySynthidPipeline(asCanvas(canvas), {
+			await applyDistortPipeline(asCanvas(canvas), {
 				...disabledOptions(),
 				reencodeRounds: 1,
 				reencodeQuality: 90,
 				psnrFloor: 10,
 			}, warnings);
-			expect(warnings).toEqual(['SynthID re-encode rounds were skipped because image/jpeg encoding is unavailable.']);
+			expect(warnings).toEqual(['Re-encode rounds were skipped because image/jpeg encoding is unavailable.']);
 			expect(Array.from(canvas.data)).toEqual(Array.from(before));
 		});
 
@@ -1169,7 +959,7 @@ describe('canvas pipeline', () => {
 			const canvas = texturedCanvas(8, 8);
 			const before = new Uint8ClampedArray(canvas.data);
 			const warnings: string[] = [];
-			await applySynthidPipeline(asCanvas(canvas), {
+			await applyDistortPipeline(asCanvas(canvas), {
 				...disabledOptions(),
 				reencodeRounds: 2,
 				reencodeQuality: 90,
@@ -1187,21 +977,21 @@ describe('canvas pipeline', () => {
 			const canvas = texturedCanvas(8, 8);
 			const before = new Uint8ClampedArray(canvas.data);
 			const warnings: string[] = [];
-			await applySynthidPipeline(asCanvas(canvas), {
+			await applyDistortPipeline(asCanvas(canvas), {
 				...disabledOptions(),
 				reencodeRounds: 2,
 				reencodeQuality: 90,
 				psnrFloor: 10,
 			}, warnings);
 			expect(canvas.toBlobCalls).toHaveLength(1);
-			expect(warnings).toEqual(['SynthID re-encode round 1 was skipped because the image/jpeg image could not be drawn.']);
+			expect(warnings).toEqual(['Re-encode round 1 was skipped because the image/jpeg image could not be drawn.']);
 			expect(Array.from(canvas.data)).toEqual(Array.from(before));
 			expect(decodeCloseCount).toBe(1);
 		});
 
 		it('closes each decoded round on the success path', async () => {
 			const canvas = texturedCanvas(8, 8);
-			await applySynthidPipeline(asCanvas(canvas), {
+			await applyDistortPipeline(asCanvas(canvas), {
 				...disabledOptions(),
 				reencodeRounds: 2,
 				reencodeQuality: 90,
@@ -1214,7 +1004,7 @@ describe('canvas pipeline', () => {
 			const canvas = texturedCanvas(32, 32);
 			const before = new Uint8ClampedArray(canvas.data);
 			const warnings: string[] = [];
-			await applySynthidPipeline(asCanvas(canvas), { ...disabledOptions(), bilateral: true, psnrFloor: 10 }, warnings);
+			await applyDistortPipeline(asCanvas(canvas), { ...disabledOptions(), bilateral: true, psnrFloor: 10 }, warnings);
 			expect(Array.from(canvas.data)).not.toEqual(Array.from(before));
 			expect(warnings).toEqual([]);
 		});
@@ -1223,9 +1013,72 @@ describe('canvas pipeline', () => {
 			const canvas = texturedCanvas(32, 32);
 			const before = new Uint8ClampedArray(canvas.data);
 			const warnings: string[] = [];
-			await applySynthidPipeline(asCanvas(canvas), { ...disabledOptions(), bilateral: true, psnrFloor: 60 }, warnings);
+			await applyDistortPipeline(asCanvas(canvas), { ...disabledOptions(), bilateral: true, psnrFloor: 60 }, warnings);
 			expect(Array.from(canvas.data)).toEqual(Array.from(before));
 			expect(warnings).toEqual([qualityFloorSkipWarning('Edge-preserving smoothing', 60)]);
+		});
+
+		it('rolls back the gated stages a strict quality floor rejects', async () => {
+			// At a floor nothing can clear, every gated stage must be rolled back
+			// and each must say so in a warning, since nothing else reports it.
+			// Squeeze and smoothing are the two gated stages the balanced preset leaves
+			// off, so turn both on before asserting that the floor rejects them.
+const strict: DistortOptions = {
+			...DISTORT_PRESETS.balanced,
+			enabled: true,
+			lumaNoiseStep: 0.1,
+			squeezeFactor: 0.9,
+			bilateral: true,
+			psnrFloor: 60,
+		};
+			const warnings: string[] = [];
+			await applyDistortPipeline(asCanvas(texturedCanvas(64, 64)), strict, warnings);
+			expect(warnings).toContain(qualityFloorSkipWarning('Resize squeeze', 60));
+			expect(warnings).toContain(qualityFloorSkipWarning('Edge-preserving smoothing', 60));
+			// The relocation stages are exempt from the floor by design, so they
+			// must not be claimed as skipped.
+			expect(warnings.some((warning) => warning.includes('Local shift'))).toBe(false);
+			expect(warnings.some((warning) => warning.includes('Rotation jitter'))).toBe(false);
+		});
+
+		it('changes the image further than a bare re-encode does', async () => {
+			// The comparison a user actually makes: does the distortion do
+			// anything the re-encode that saving a JPEG forces anyway would not?
+			// Both runs share a seeded draw and the same codec, so the
+			// distortion stages are the only difference between them. Measured
+			// as the fidelity cost against the source, which is the only thing
+			// measurable here.
+			const options: DistortOptions = { enabled: true, lumaNoiseStep: 0.1, ...DISTORT_PRESETS.balanced };
+			// A gentle fixed quantization step stands in for the encoder, so the
+			// comparison is about what the distortion adds on top of it.
+			encodeTransform = (data) => quantizePixels(data, 2);
+
+			const run = async (settings: DistortOptions) => {
+				vi.spyOn(Math, 'random').mockImplementation(createSeededRandom(12345));
+				const canvas = texturedCanvas(256, 256);
+				const source = new Uint8ClampedArray(canvas.data);
+				await applyDistortPipeline(asCanvas(canvas), settings, []);
+				return computePsnr(source, canvas.data, false);
+			};
+
+			// Every distortion stage disabled: only the re-encode chain runs.
+			const reencodeOnly = await run({
+				...options,
+				elasticAlpha: 0,
+				rotationJitter: 0,
+				squeezeFactor: 1,
+				colorAmount: 0,
+				lumaNoise: 0,
+				bilateral: false,
+			});
+			const distorted = await run(options);
+
+			// The distortion has to cost more fidelity than the encoder alone.
+			// If the two ever matched, the stage set would be doing nothing the
+			// re-encode was not already doing, which is the ambiguity this
+			// exists to rule out.
+			expect(reencodeOnly).toBeLessThan(Infinity);
+			expect(distorted).toBeLessThan(reencodeOnly);
 		});
 	});
 
@@ -1310,7 +1163,7 @@ describe('canvas pipeline', () => {
 				{ ...disabledOptions(), enabled: true, psnrFloor: 35 }, new Uint8ClampedArray(canvas.data), warnings
 			);
 			expect(canvas.toBlobCalls).toHaveLength(1);
-			expect(warnings).toEqual(['The final image/png encode fell below the 35 dB quality floor, so some SynthID signal may survive in the output.']);
+			expect(warnings).toEqual(['The final image/png encode fell below the 35 dB quality floor, so the delivered pixels differ from the ones the pipeline produced by more than the floor allows.']);
 		});
 
 		it('does not bump past the maximum encoder quality', async () => {
@@ -1345,7 +1198,7 @@ describe('canvas pipeline', () => {
 				asCanvas(canvas), 'image/png', undefined,
 				{ ...disabledOptions(), enabled: true, psnrFloor: 30 }, new Uint8ClampedArray(canvas.data), warnings
 			);
-			expect(warnings).toEqual(['The final image/png encode fell below the 30 dB quality floor, so some SynthID signal may survive in the output.']);
+			expect(warnings).toEqual(['The final image/png encode fell below the 30 dB quality floor, so the delivered pixels differ from the ones the pipeline produced by more than the floor allows.']);
 		});
 
 		it('accepts a JPEG encode that flattens a fully transparent canvas', async () => {
@@ -1379,7 +1232,7 @@ describe('canvas pipeline', () => {
 				{ ...disabledOptions(), enabled: true, psnrFloor: 30 }, new Uint8ClampedArray(canvas.data), warnings
 			);
 			expect(canvas.toBlobCalls).toHaveLength(1);
-			expect(warnings).toEqual(['The final image/webp encode fell below the 30 dB quality floor, so some SynthID signal may survive in the output.']);
+			expect(warnings).toEqual(['The final image/webp encode fell below the 30 dB quality floor, so the delivered pixels differ from the ones the pipeline produced by more than the floor allows.']);
 		});
 	});
 });

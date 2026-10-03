@@ -277,13 +277,35 @@ const FALLBACK_HASH_PREFIX = 'fnv1a-';
 
 // Whether a digest came from the fallback rather than SHA-256. The fingerprint
 // is not cryptographic, so callers that key correctness-critical state by hash
-// (e.g. the SynthID verdict cache) must not treat these digests as unique.
+// must not treat these digests as unique; the results list uses this to label
+// the digest honestly instead of claiming SHA-256.
 export function isFallbackHash(hash: string): boolean {
 	return hash.startsWith(FALLBACK_HASH_PREFIX);
 }
 
-export async function computeSha256(blob: Blob): Promise<string> {
-	const buffer = await blob.arrayBuffer();
+// Inputs at or above this size are not digested by the declaration pre-flight.
+// Hashing one reads the whole file into memory, which that scan does not need:
+// it reads a bounded window, and processing computes the digest later when the
+// identical-output check needs one anyway. The value has to sit above the
+// scanner's own total read, so that below it the digest is the cheaper key and
+// above it the bounded scan is, and neither choice ever materializes a huge
+// file. That total is SCAN_WINDOW_BYTES, which lives with the scanner rather
+// than being restated here; util.test.ts asserts the two against each other.
+export const LARGE_INPUT_BYTES = 16 * 1024 * 1024;
+
+// Whether a content key is safe to cache a declaration under. Only a real
+// digest qualifies: the non-crypto fallback fingerprint cannot be treated as
+// unique, and a collision would hand one file another's declaration.
+export function isContentDigest(key: string): boolean {
+	return !isFallbackHash(key);
+}
+
+/**
+ * Digests bytes the caller already holds. Same digest and same fallback as
+ * computeSha256, exposed separately so a caller that had to read a file whole
+ * for its own reasons can hash the same buffer instead of reading it again.
+ */
+export async function sha256HexFromBuffer(buffer: ArrayBuffer): Promise<string> {
 	// crypto.subtle is unavailable outside secure contexts (plain HTTP, some
 	// embedded webviews). Fall back to a local FNV-1a fingerprint. Both sides
 	// of the identical-output check use this same function, so the comparison
@@ -293,6 +315,10 @@ export async function computeSha256(blob: Blob): Promise<string> {
 	}
 	const digest = await crypto.subtle.digest('SHA-256', buffer);
 	return arrayBufferToHex(digest);
+}
+
+export async function computeSha256(blob: Blob): Promise<string> {
+	return sha256HexFromBuffer(await blob.arrayBuffer());
 }
 
 // 64-bit local fingerprint built from two 32-bit passes (FNV-1a plus FNV-1

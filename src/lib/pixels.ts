@@ -83,7 +83,7 @@ export function boxBlur(imageData: Bitmap, radius: number): void {
 	imageData.data.set(dst);
 }
 
-// Pre-pipeline pixel wash. Runs before the SynthID pipeline so it conditions
+// Pre-pipeline pixel wash. Runs before the distortion pipeline so it conditions
 // the source pixels; LSB work happens separately after the pipeline.
 export function applyBlurEffect(imageData: Bitmap, options: ProcessingOptions): void {
 	if (options.applyBlur && options.blurRadius > 0) {
@@ -91,7 +91,7 @@ export function applyBlurEffect(imageData: Bitmap, options: ProcessingOptions): 
 	}
 }
 
-// LSB pass for pixel-oriented output. Runs after the SynthID pipeline so the
+// LSB pass for pixel-oriented output. Runs after the distortion pipeline so the
 // bits stay clean in the output; the pipeline's resampling and re-encode
 // stages would otherwise re-derive and scramble them. Palette formats (GIF)
 // serialize a palette rather than pixels, so they run applyPaletteLsb after
@@ -102,60 +102,6 @@ export function applyLsbEffect(imageData: Bitmap, options: ProcessingOptions): v
 	} else if (options.randomizeLsb) {
 		randomizeLSBs(imageData);
 	}
-}
-
-// Shared quarter-turn rotation. `clockwise` selects where the source's top
-// row lands in the output; either direction returns a new buffer and copies
-// RGBA pixels verbatim, so no interpolation is involved.
-function rotate90(bitmap: Bitmap, clockwise: boolean): Bitmap {
-	const { width, height, data } = bitmap;
-	const out = new Uint8ClampedArray(data.length);
-	for (let y = 0; y < height; y += 1) {
-		for (let x = 0; x < width; x += 1) {
-			const src = (y * width + x) * 4;
-			const dst = clockwise
-				? (x * height + (height - 1 - y)) * 4
-				: ((width - 1 - x) * height + y) * 4;
-			out[dst] = data[src];
-			out[dst + 1] = data[src + 1];
-			out[dst + 2] = data[src + 2];
-			out[dst + 3] = data[src + 3];
-		}
-	}
-	return { width: height, height: width, data: out };
-}
-
-// Rotates an RGBA bitmap 90 degrees clockwise. Watermark detection uses this
-// to restore a profile's orientation before resampling when a delivered image
-// arrives transposed.
-export function rotate90Clockwise(bitmap: Bitmap): Bitmap {
-	return rotate90(bitmap, true);
-}
-
-// Rotates an RGBA bitmap 90 degrees counterclockwise. A transposed delivery
-// can come from either direction, so detection scores both quarter turns and
-// needs both restorations.
-export function rotate90Counterclockwise(bitmap: Bitmap): Bitmap {
-	return rotate90(bitmap, false);
-}
-
-// Rotates an RGBA bitmap 180 degrees. Dimensions are unchanged, so this is
-// the only non-identity orientation an image can hide without its size giving
-// it away; like the quarter turns, it copies pixels verbatim.
-export function rotate180(bitmap: Bitmap): Bitmap {
-	const { width, height, data } = bitmap;
-	const out = new Uint8ClampedArray(data.length);
-	for (let y = 0; y < height; y += 1) {
-		for (let x = 0; x < width; x += 1) {
-			const src = (y * width + x) * 4;
-			const dst = ((height - 1 - y) * width + (width - 1 - x)) * 4;
-			out[dst] = data[src];
-			out[dst + 1] = data[src + 1];
-			out[dst + 2] = data[src + 2];
-			out[dst + 3] = data[src + 3];
-		}
-	}
-	return { width, height, data: out };
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +360,7 @@ export function squeezeImageData(imageData: Bitmap, factor: number): void {
 }
 
 // ---------------------------------------------------------------------------
-// SynthID attack pipeline pixel stages
+// Distortion pipeline pixel stages
 //
 // Signal-processing stages of the attack documented by the reverse-SynthID
 // project (https://github.com/aloshdenny/reverse-SynthID) against the

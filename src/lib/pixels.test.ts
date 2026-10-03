@@ -19,9 +19,6 @@ import {
 	lanczos3Kernel,
 	randomizeLSBs,
 	resampleSeparable,
-	rotate90Clockwise,
-	rotate90Counterclockwise,
-	rotate180,
 	squeezeImageData,
 } from './pixels';
 import { combinedPsnr } from './metrics';
@@ -59,7 +56,7 @@ function baseOptions(overrides: Partial<ProcessingOptions> = {}): ProcessingOpti
 		blurRadius: 1,
 		jpegRecompress: false,
 		jpegQuality: 85,
-		synthid: {
+		distort: {
 			enabled: false,
 			elasticAlpha: 0,
 			elasticSigma: 50,
@@ -67,12 +64,12 @@ function baseOptions(overrides: Partial<ProcessingOptions> = {}): ProcessingOpti
 			squeezeFactor: 1,
 			colorAmount: 0,
 			lumaNoise: 0,
+			lumaNoiseStep: 0.1,
 			reencodeRounds: 0,
 			reencodeQuality: 88,
 			bilateral: false,
 			psnrFloor: 24,
 		},
-		synthidScope: 'all',
 		outputFormats: {},
 		filenameMode: 'suffix',
 		outputSuffix: '-clean',
@@ -698,104 +695,6 @@ describe('applyWarpStage exact quarter rotations', () => {
 				expect(bmp.data[(y * size + x) * 4]).toBe(srcP);
 			}
 		}
-	});
-});
-
-describe('rotate90Clockwise', () => {
-	it('rotates pixels and dimensions clockwise', () => {
-		const bmp = makeBitmap(2, 3);
-		for (let y = 0; y < 3; y += 1) {
-			for (let x = 0; x < 2; x += 1) {
-				const p = y * 2 + x;
-				bmp.data[p * 4] = p + 1;
-				bmp.data[p * 4 + 1] = 255 - (p + 1);
-				bmp.data[p * 4 + 3] = 255;
-			}
-		}
-		const rotated = rotate90Clockwise(bmp);
-		expect(rotated.width).toBe(3);
-		expect(rotated.height).toBe(2);
-		// Source layout (labels by pixel): 1 2 / 3 4 / 5 6. Clockwise, the
-		// left column becomes the top row, so the output reads 5 3 1 / 6 4 2.
-		const redAt = (x: number, y: number) => rotated.data[(y * 3 + x) * 4];
-		const greenAt = (x: number, y: number) => rotated.data[(y * 3 + x) * 4 + 1];
-		expect([redAt(0, 0), redAt(1, 0), redAt(2, 0)]).toEqual([5, 3, 1]);
-		expect([redAt(0, 1), redAt(1, 1), redAt(2, 1)]).toEqual([6, 4, 2]);
-		expect(greenAt(0, 0)).toBe(250);
-		expect(greenAt(2, 1)).toBe(253);
-		// The source bitmap is not disturbed.
-		expect(bmp.data[0]).toBe(1);
-	});
-});
-
-describe('rotate90Counterclockwise', () => {
-	it('rotates pixels and dimensions counterclockwise', () => {
-		const bmp = makeBitmap(2, 3);
-		for (let y = 0; y < 3; y += 1) {
-			for (let x = 0; x < 2; x += 1) {
-				const p = y * 2 + x;
-				bmp.data[p * 4] = p + 1;
-				bmp.data[p * 4 + 1] = 255 - (p + 1);
-				bmp.data[p * 4 + 3] = 255;
-			}
-		}
-		const rotated = rotate90Counterclockwise(bmp);
-		expect(rotated.width).toBe(3);
-		expect(rotated.height).toBe(2);
-		// Source layout (labels by pixel): 1 2 / 3 4 / 5 6. Counterclockwise,
-		// the right column becomes the top row, so the output reads 2 4 6 / 1 3 5.
-		const redAt = (x: number, y: number) => rotated.data[(y * 3 + x) * 4];
-		expect([redAt(0, 0), redAt(1, 0), redAt(2, 0)]).toEqual([2, 4, 6]);
-		expect([redAt(0, 1), redAt(1, 1), redAt(2, 1)]).toEqual([1, 3, 5]);
-		// The source bitmap is not disturbed.
-		expect(bmp.data[0]).toBe(1);
-	});
-
-	it('undoes the clockwise rotation exactly, dimensions included', () => {
-		const bmp = makeBitmap(5, 3);
-		for (let i = 0; i < bmp.data.length; i += 1) bmp.data[i] = (i * 37 + 11) & 0xff;
-		const restored = rotate90Counterclockwise(rotate90Clockwise(bmp));
-		expect(restored.width).toBe(bmp.width);
-		expect(restored.height).toBe(bmp.height);
-		expect(Array.from(restored.data)).toEqual(Array.from(bmp.data));
-	});
-});
-
-describe('rotate180', () => {
-	it('turns pixels around and keeps the dimensions', () => {
-		const bmp = makeBitmap(2, 3);
-		for (let y = 0; y < 3; y += 1) {
-			for (let x = 0; x < 2; x += 1) {
-				const p = y * 2 + x;
-				bmp.data[p * 4] = p + 1;
-				bmp.data[p * 4 + 1] = 255 - (p + 1);
-				bmp.data[p * 4 + 3] = 255;
-			}
-		}
-		const rotated = rotate180(bmp);
-		expect(rotated.width).toBe(2);
-		expect(rotated.height).toBe(3);
-		// Source layout (labels by pixel): 1 2 / 3 4 / 5 6. A half turn reads
-		// 6 5 / 4 3 / 2 1.
-		const redAt = (x: number, y: number) => rotated.data[(y * 2 + x) * 4];
-		const greenAt = (x: number, y: number) => rotated.data[(y * 2 + x) * 4 + 1];
-		expect([redAt(0, 0), redAt(1, 0), redAt(0, 1), redAt(1, 1), redAt(0, 2), redAt(1, 2)]).toEqual([6, 5, 4, 3, 2, 1]);
-		expect(greenAt(0, 0)).toBe(249);
-		expect(greenAt(1, 2)).toBe(254);
-		// The source bitmap is not disturbed.
-		expect(bmp.data[0]).toBe(1);
-	});
-
-	it('matches two clockwise quarter turns and is its own inverse', () => {
-		const bmp = makeBitmap(5, 3);
-		for (let i = 0; i < bmp.data.length; i += 1) bmp.data[i] = (i * 37 + 11) & 0xff;
-		const twice = rotate90Clockwise(rotate90Clockwise(bmp));
-		const rotated = rotate180(bmp);
-		expect(rotated.width).toBe(bmp.width);
-		expect(rotated.height).toBe(bmp.height);
-		expect(Array.from(rotated.data)).toEqual(Array.from(twice.data));
-		const restored = rotate180(rotated);
-		expect(Array.from(restored.data)).toEqual(Array.from(bmp.data));
 	});
 });
 

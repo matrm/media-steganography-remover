@@ -1,11 +1,9 @@
 import type {
 	Bitmap,
 	FrameSize,
-	SynthidDetection,
-	SynthidOptions,
-	SynthidPreset,
-	SynthidRandomState,
-	SynthidScope,
+	DistortOptions,
+	DistortPreset,
+	DistortRandomState,
 } from './types';
 import { canvasToBlob, createSeededRandom, yieldToBrowser } from './util';
 import {
@@ -29,30 +27,27 @@ import {
 } from './metrics';
 
 // ---------------------------------------------------------------------------
-// SynthID attack pipeline
+// Media distortion pipeline
 //
-// Signal-processing stages of the attack documented by the reverse-SynthID
-// project (https://github.com/aloshdenny/reverse-SynthID) against the
-// watermark described in the SynthID-Image paper
+// Signal-processing stages that disturb the pixel grid a steganographic
+// watermark survives in. The stage set follows the attack documented by the
+// reverse-SynthID project (https://github.com/aloshdenny/reverse-SynthID),
+// which is aimed at the watermark described in the SynthID-Image paper
 // (https://arxiv.org/abs/2510.09263).
+//
+// This is a best-effort distortion, not a verified removal. It was measured
+// against Google's own SynthID checker on real Gemini output and did not
+// defeat it at any setting, so it is presented as a generic distortion that
+// may disturb some embedded watermarks rather than as SynthID removal.
 // ---------------------------------------------------------------------------
 
-export const MAX_SYNTHID_IMAGE_PIXELS = 20_000_000;
-export const MAX_SYNTHID_GIF_PIXELS = 8_000_000;
-// Longest-side cap for the detection pass, so the detector never allocates a
-// buffer proportional to an unbounded input resolution.
-export const MAX_DETECT_DIMENSION = 4096;
-// Extra attack attempts with a fresh random draw when the encoded output
-// still reads as watermarked. Each retry re-runs the pipeline from the
-// pristine source rather than from the previous output, so quality never
-// compounds; the per-draw success rates compound instead, and each extra draw
-// is another chance to land a marginal watermark below the detection line.
-export const SYNTHID_RETRY_ATTEMPTS = 4;
+export const MAX_DISTORT_PIXELS = 20_000_000;
+export const MAX_GIF_PIXELS = 8_000_000;
 
-// Presets mirroring the reverse-SynthID Round 06 "final"/"nuke" strengths
-// (https://github.com/aloshdenny/reverse-SynthID), scaled down for a
+// Strength presets, scaled down from the reverse-SynthID Round 06
+// "final"/"nuke" settings (https://github.com/aloshdenny/reverse-SynthID) for a
 // signal-processing-only pipeline.
-export const SYNTHID_PRESETS: Record<'gentle' | 'balanced' | 'aggressive', SynthidPreset> = {
+export const DISTORT_PRESETS: Record<'gentle' | 'balanced' | 'aggressive', DistortPreset> = {
 	gentle: {
 		elasticAlpha: 1.2,
 		elasticSigma: 55,
@@ -168,7 +163,7 @@ function visibilitySkipWarning(stageName: string): string {
 	return `${stageName} was skipped: it would make fully transparent pixels visible.`;
 }
 
-function recordSynthidRollback(warnings: string[], stageName: string, outcome: FloorOutcome, floorDb: number): void {
+function recordStageRollback(warnings: string[], stageName: string, outcome: FloorOutcome, floorDb: number): void {
 	if (outcome === 'accepted') return;
 	const warning = outcome === 'visible'
 		? visibilitySkipWarning(stageName)
@@ -178,7 +173,7 @@ function recordSynthidRollback(warnings: string[], stageName: string, outcome: F
 
 // Runs one pixel stage either directly or under the quality-floor gate,
 // recording a skip warning when a gated run rolls back.
-async function applySynthidStage(
+async function applyGatedStage(
 	imageData: Bitmap,
 	stageName: string,
 	stage: (data: Bitmap) => void | Promise<void>,
@@ -191,35 +186,35 @@ async function applySynthidStage(
 		return;
 	}
 	const outcome = await applyWithPsnrFloor(imageData, stage, floorDb);
-	recordSynthidRollback(warnings, stageName, outcome, floorDb);
+	recordStageRollback(warnings, stageName, outcome, floorDb);
 }
 
 // Individual distortion-stage runners, factored out so the animated-GIF
 // pipeline and the static image pipeline share one implementation. Heavy
 // stages yield cooperatively per row band, so callers only await.
-async function applySqueezeStage(imageData: Bitmap, options: SynthidOptions, gated: boolean, warnings: string[]): Promise<void> {
+async function applySqueezeStage(imageData: Bitmap, options: DistortOptions, gated: boolean, warnings: string[]): Promise<void> {
 	// Treat invalid factors as disabled: 0/negative would collapse to a flat
 	// field, non-finite would poison dimensions.
 	if (!Number.isFinite(options.squeezeFactor) || options.squeezeFactor <= 0 || options.squeezeFactor >= 1) return;
 	const squeezeFactor = options.squeezeFactor;
-	await applySynthidStage(imageData, 'Resize squeeze', (data) => {
+	await applyGatedStage(imageData, 'Resize squeeze', (data) => {
 		squeezeImageData(data, squeezeFactor);
 	}, gated, options.psnrFloor, warnings);
 }
 
-async function applyColorStage(imageData: Bitmap, state: SynthidRandomState, options: SynthidOptions, gated: boolean, warnings: string[]): Promise<void> {
+async function applyColorStage(imageData: Bitmap, state: DistortRandomState, options: DistortOptions, gated: boolean, warnings: string[]): Promise<void> {
 	if (!state.color) return;
 	const color = state.color;
-	await applySynthidStage(imageData, 'Color shift', (data) => {
+	await applyGatedStage(imageData, 'Color shift', (data) => {
 		applyColorShift(data, color);
 	}, gated, options.psnrFloor, warnings);
 }
 
-async function applyNoiseStage(imageData: Bitmap, state: SynthidRandomState, options: SynthidOptions, gated: boolean, warnings: string[]): Promise<void> {
+async function applyNoiseStage(imageData: Bitmap, state: DistortRandomState, options: DistortOptions, gated: boolean, warnings: string[]): Promise<void> {
 	if (options.lumaNoise <= 0) return;
 	const lumaNoise = options.lumaNoise;
 	const noiseSeed = state.noiseSeed;
-	await applySynthidStage(imageData, 'Luma noise', (data) => {
+	await applyGatedStage(imageData, 'Luma noise', (data) => {
 		// A fresh generator from the per-file seed on every call keeps every
 		// frame's pattern identical (no flicker) while files still differ.
 		addLumaNoise(data, lumaNoise, createSeededRandom(noiseSeed));
@@ -236,10 +231,10 @@ async function applyNoiseStage(imageData: Bitmap, state: SynthidRandomState, opt
 // main structural attacks on most real content while probing for a fitting
 // strength costs more warps than the stage is worth. The floor therefore
 // governs the genuinely lossy stages below.
-export async function applySynthidDistortionStages(
+export async function applyDistortStages(
 	imageData: Bitmap,
-	state: SynthidRandomState,
-	options: SynthidOptions,
+	state: DistortRandomState,
+	options: DistortOptions,
 	gated: boolean,
 	warnings: string[]
 ): Promise<void> {
@@ -252,14 +247,14 @@ export async function applySynthidDistortionStages(
 
 // Final edge-preserving smoothing pass shared by both pipelines; the only
 // difference between media types is whether it runs under the quality floor.
-export async function applySynthidSmoothingStage(
+export async function applyDistortSmoothingStage(
 	imageData: Bitmap,
-	options: SynthidOptions,
+	options: DistortOptions,
 	gated: boolean,
 	warnings: string[]
 ): Promise<void> {
 	if (!options.bilateral) return;
-	await applySynthidStage(imageData, 'Edge-preserving smoothing', (data) => {
+	await applyGatedStage(imageData, 'Edge-preserving smoothing', (data) => {
 		return bilateralFilter(data, BILATERAL_RADIUS, BILATERAL_SIGMA_COLOR);
 	}, gated, options.psnrFloor, warnings);
 }
@@ -271,7 +266,7 @@ export async function applySynthidSmoothingStage(
 // Strengths below a whole pixel cannot survive integer quantization (they
 // round to zero everywhere), so they are treated as disabled instead of
 // running a wasted exact-copy stage.
-export function buildSynthidRandomState(width: number, height: number, options: SynthidOptions): SynthidRandomState {
+export function buildDistortRandomState(width: number, height: number, options: DistortOptions): DistortRandomState {
 	return {
 		tileShift: options.elasticAlpha >= 1
 			? generateTileShiftState(width, height, options.elasticAlpha, options.elasticSigma)
@@ -282,79 +277,9 @@ export function buildSynthidRandomState(width: number, height: number, options: 
 	};
 }
 
-// Applies the "detected" scope gate to a SynthID config: under the detected
-// scopes, removal is skipped when the input carries no watermark, when
-// detection failed, or when the input is too small for a trusted check (the
-// latter two with a warning). An inconclusive verdict carries no reliable
-// signal either way, so it must not quiet-skip like a clean check or
-// quiet-run like a detected one. A conclusive clean skip stays quiet to avoid
-// warning spam on clean batches; the verdict line still shows why nothing ran
-// because callers verify whenever inputCheck exists. The 'all' scope is never
-// gated. Used by every path whose input the detector can read: static images,
-// GIFs, and still images routed through FFmpeg.
-export function gateSynthidByDetection(
-	synthid: SynthidOptions,
-	scope: SynthidScope,
-	inputCheck: SynthidDetection | null,
-	warnings: string[]
-): SynthidOptions {
-	if (synthid.enabled && scope !== 'all') {
-		if (inputCheck === null) {
-			warnings.push('SynthID detection failed for this image, so removal was skipped.');
-			return { ...synthid, enabled: false };
-		}
-		// A clean match too small to carry the profile's carriers cannot be
-		// ruled clean, and its phase score is noise regardless of which side
-		// of the boundary it lands on, so disclose the skip instead of letting
-		// the verdict read as a clean check the file passed or silently
-		// running the attack on a coin flip.
-		if (!inputCheck.conclusive) {
-			warnings.push('This image is too small to carry the SynthID carriers, so the check was inconclusive and removal was skipped. Use the All inputs scope to apply it anyway.');
-			return { ...synthid, enabled: false };
-		}
-		if (!inputCheck.isWatermarked) {
-			return { ...synthid, enabled: false };
-		}
-	}
-	return synthid;
-}
-
-// Applies the scope rules to an input routed through FFmpeg. A real video
-// cannot be read by the detector, so its decision is scope-only; a still
-// image routed through FFmpeg (a GIF converted to MP4) is still covered by
-// the detector, so it goes through the same verdict gate as the still-image
-// and GIF paths instead of the scope shortcut.
-export function gateVideoSynthid(
-	inputIsVideo: boolean,
-	synthid: SynthidOptions,
-	scope: SynthidScope,
-	inputCheck: SynthidDetection | null,
-	warnings: string[]
-): SynthidOptions {
-	if (inputIsVideo) {
-		return { ...synthid, enabled: synthid.enabled && scope !== 'detected-no-video' };
-	}
-	return gateSynthidByDetection(synthid, scope, inputCheck, warnings);
-}
-
 export function gifQualityToMaxColors(quality: number): number {
 	const normalized = Math.max(0, Math.min(1, (quality - 60) / 40));
 	return Math.round(64 + normalized * 192);
-}
-
-/**
- * Picks which animation frames the SynthID detector should inspect.
- * Watermarks can vary across frames (scene cuts, splices, per-frame
- * generation), so checking only the first frame misses later content.
- * Short animations check every frame; longer ones sample the first, middle,
- * and last composed frames to bound the detection cost.
- */
-export function selectGifCheckIndices(frameCount: number): number[] {
-	if (!Number.isFinite(frameCount) || frameCount <= 0) return [];
-	const count = Math.floor(frameCount);
-	if (count <= 3) return Array.from({ length: count }, (_, i) => i);
-	const indices = [0, Math.floor(count / 2), count - 1];
-	return [...new Set(indices)].sort((a, b) => a - b);
 }
 
 // Lossy re-encode round trips. JPEG for opaque images, WebP when transparency
@@ -378,14 +303,14 @@ async function runReencodeChain(
 		const q = quality / 100;
 		const blob = await canvasToBlob(canvas, mime, q);
 		if (blob.type !== mime) {
-			warnings.push(`SynthID re-encode rounds were skipped because ${mime} encoding is unavailable.`);
+			warnings.push(`Re-encode rounds were skipped because ${mime} encoding is unavailable.`);
 			break;
 		}
 		let bitmap: ImageBitmap;
 		try {
 			bitmap = await createImageBitmap(blob);
 		} catch {
-			warnings.push(`SynthID re-encode round ${i + 1} was skipped because ${mime} decoding is unavailable.`);
+			warnings.push(`Re-encode round ${i + 1} was skipped because ${mime} decoding is unavailable.`);
 			break;
 		}
 		try {
@@ -395,7 +320,7 @@ async function runReencodeChain(
 			// The clear runs before the draw, so a failed draw leaves a blank
 			// canvas behind; restore the pre-round pixels before leaving.
 			ctx.putImageData(beforeRound, 0, 0);
-			warnings.push(`SynthID re-encode round ${i + 1} was skipped because the ${mime} image could not be drawn.`);
+			warnings.push(`Re-encode round ${i + 1} was skipped because the ${mime} image could not be drawn.`);
 			break;
 		} finally {
 			bitmap.close();
@@ -407,7 +332,7 @@ async function runReencodeChain(
 		if (!anyVisiblePixel(beforeRound.data)) {
 			if (anyVisiblePixel(afterRound.data)) {
 				ctx.putImageData(beforeRound, 0, 0);
-				recordSynthidRollback(warnings, `Re-encode round ${i + 1}`, 'visible', floorDb);
+				recordStageRollback(warnings, `Re-encode round ${i + 1}`, 'visible', floorDb);
 				break;
 			}
 			continue;
@@ -416,58 +341,33 @@ async function runReencodeChain(
 		// bleed into transparent regions even when the score still clears.
 		if (hasNewlyVisiblePixels(beforeRound.data, afterRound.data)) {
 			ctx.putImageData(beforeRound, 0, 0);
-			recordSynthidRollback(warnings, `Re-encode round ${i + 1}`, 'visible', floorDb);
+			recordStageRollback(warnings, `Re-encode round ${i + 1}`, 'visible', floorDb);
 			break;
 		}
 		const score = combinedPsnr(beforeRound.data, afterRound.data);
 		if (!(score >= floorDb)) {
 			ctx.putImageData(beforeRound, 0, 0);
-			recordSynthidRollback(warnings, `Re-encode round ${i + 1}`, 'floor', floorDb);
+			recordStageRollback(warnings, `Re-encode round ${i + 1}`, 'floor', floorDb);
 			break;
 		}
 	}
 }
 
-// Retry rule for the static pipeline: a flagged output earns another fresh
-// draw while attempts remain, but only when the input was actually
-// watermarked, since a clean input has no watermark left to remove.
-export function shouldRetrySynthidAttempt(
-	inputWatermarked: boolean,
-	outputWatermarked: boolean,
-	attempt: number,
-	totalAttempts: number
-): boolean {
-	return inputWatermarked && outputWatermarked && attempt < totalAttempts - 1;
-}
-
-// Post-loop rule for the static pipeline: deliver the least watermarked
-// measured draw rather than the last one. The canvas draw loses to the best
-// measured draw when it is strictly more watermarked, and whenever its probe
-// failed before measuring it, because an unmeasured draw cannot claim the
-// deliverable slot over one the pipeline already scored. Callers without any
-// measured draw keep whatever is on the canvas.
-export function shouldRestoreBestDraw(
-	best: { confidence: number },
-	drawn: { confidence: number } | null
-): boolean {
-	return !drawn || best.confidence < drawn.confidence;
-}
-
-export async function applySynthidPipeline(
+export async function applyDistortPipeline(
 	canvas: HTMLCanvasElement,
-	options: SynthidOptions,
+	options: DistortOptions,
 	warnings: string[]
 ): Promise<void> {
 	const ctx = canvas.getContext('2d', { willReadFrequently: true });
 	if (!ctx) return;
 	const { width, height } = canvas;
-	const state = buildSynthidRandomState(width, height, options);
+	const state = buildDistortRandomState(width, height, options);
 
 	// Heavy stages yield cooperatively per row band internally; the awaits
 	// here sequence the groups while keeping the UI alive.
 	await yieldToBrowser();
 	const imageData = ctx.getImageData(0, 0, width, height);
-	await applySynthidDistortionStages(imageData, state, options, true, warnings);
+	await applyDistortStages(imageData, state, options, true, warnings);
 	ctx.putImageData(imageData, 0, 0);
 	await yieldToBrowser();
 
@@ -480,7 +380,7 @@ export async function applySynthidPipeline(
 
 	// Stage 7: edge-preserving smoothing.
 	const smoothed = ctx.getImageData(0, 0, width, height);
-	await applySynthidSmoothingStage(smoothed, options, true, warnings);
+	await applyDistortSmoothingStage(smoothed, options, true, warnings);
 	ctx.putImageData(smoothed, 0, 0);
 }
 
@@ -524,7 +424,7 @@ export async function encodeStaticImage(
 	canvas: HTMLCanvasElement,
 	mime: string,
 	quality: number | undefined,
-	options: SynthidOptions,
+	options: DistortOptions,
 	preEncode: Uint8ClampedArray | null,
 	warnings: string[]
 ): Promise<Blob> {
@@ -533,7 +433,7 @@ export async function encodeStaticImage(
 		throw new Error(`Canvas does not support ${mime} output. It returned ${blob.type || 'an unknown format'}.`);
 	}
 	if (!options.enabled) return blob;
-	// Reaching here means the caller ran the SynthID pipeline with enabled,
+	// Reaching here means the caller ran the distortion pipeline with enabled,
 	// and the sole caller builds preEncode exactly when enabled, so it is
 	// non-null. The check narrows the type and guards any future caller that
 	// violates that invariant; this path is otherwise unreachable.
@@ -569,16 +469,16 @@ export async function encodeStaticImage(
 			}
 		}
 		warnings.push(bumped
-			? `The final ${mime} encode fell below the ${options.psnrFloor} dB quality floor even after a small encoder quality bump, so some SynthID signal may survive in the output.`
-			: `The final ${mime} encode fell below the ${options.psnrFloor} dB quality floor, so some SynthID signal may survive in the output.`);
+			? `The final ${mime} encode fell below the ${options.psnrFloor} dB quality floor even after a small encoder quality bump, so the delivered pixels differ from the ones the pipeline produced by more than the floor allows.`
+			: `The final ${mime} encode fell below the ${options.psnrFloor} dB quality floor, so the delivered pixels differ from the ones the pipeline produced by more than the floor allows.`);
 	} catch {
 		warnings.push(`Could not validate the ${mime} output against the quality floor, but the result was kept.`);
 	}
 	return blob;
 }
 
-export function buildSynthidVideoFilters(
-	options: SynthidOptions,
+export function buildDistortVideoFilters(
+	options: DistortOptions,
 	frameSize: FrameSize | null,
 	random: () => number = Math.random,
 	warnings: string[] = []
